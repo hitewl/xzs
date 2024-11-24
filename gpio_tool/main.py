@@ -40,7 +40,7 @@ class MainWindow(QMainWindow, Ui_MainWindow,plat_config):
             print(self.select_plat)
         
 if __name__ == "__main__":
-
+    print("hello world")
     app = QApplication([])
     window = MainWindow()
     window.setWindowTitle("gpio_tool")
