@@ -11,6 +11,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.reg_tool = Ui_MainWindow()
         self.reg_tool.setupUi(self)
         self.line_input = self.reg_tool.lineEdit
+        self.line_input.setPlaceholderText("0x00")
         self.line_input.textChanged.connect(self.hander_textChanged) 
         self.spinBox_list = []
         self.reg_tool.button_hex.clicked.connect(self.hander_button_hex_checked)
