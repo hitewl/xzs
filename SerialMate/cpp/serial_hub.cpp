@@ -205,7 +205,7 @@ int main(int argc, char** argv) {
     SOCKET srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    addr.sin_addr.s_addr = INADDR_ANY;      // 绑所有网卡：本机 127.0.0.1 与局域网都能连
     addr.sin_port = htons((u_short)g_tcpPort);
     if (bind(srv, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
         printf("[hub] TCP 端口 %d 被占用，可能已有一个枢纽在运行\n", g_tcpPort);

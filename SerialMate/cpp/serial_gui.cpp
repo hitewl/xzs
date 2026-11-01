@@ -232,6 +232,8 @@ struct Session {
 
 static std::vector<std::unique_ptr<Session>> g_sess;
 static Session* g_cur = nullptr;       // 当前显示中的会话
+static Session* g_hubSess = nullptr;   // 提供接管服务的本地串口会话（接管服务写数据要写它，
+                                       // 不能写 g_cur——否则远程会话当道时会把数据回灌自己）
 static int      g_nextSessId = 1;
 static std::mutex g_wrMtx;             // 串口写锁（读不持锁）
 
@@ -551,6 +553,19 @@ static void viewReplace(const wchar_t* t) {
 
 static long viewTextLen(HWND h) { return (long)SendMessageW(h, WM_GETTEXTLENGTH, 0, 0); }
 
+// 把插入点挪到文档真正的末尾再读回来。
+// 坑：RichEdit 的 WM_GETTEXTLENGTH 把段落符按 \r\n 两个字符计，而 CHARRANGE/EM_EXSETSEL
+// 的下标是按 \r 一个字符算的——直接拿长度当插入位置，每多一行就偏 1，
+// 攒够以后 EM_REPLACESEL 会落在**错误的位置**上，把提示符重复写进画面
+// （表现为 root@root@ATK-IMX6U:~#，切会话后必现）。
+static long caretToEnd() {
+    CHARRANGE cr{ 0x7FFFFFFF, 0x7FFFFFFF };
+    SendMessageW(g_hView, EM_EXSETSEL, 0, (LPARAM)&cr);
+    CHARRANGE out{};
+    SendMessageW(g_hView, EM_EXGETSEL, 0, (LPARAM)&out);
+    return out.cpMax;
+}
+
 // 全文：用 GT_DEFAULT，行尾是单个 \r，与 CHARRANGE 下标口径一致
 static std::wstring viewText() {
     if (!g_hView) return L"";
@@ -594,25 +609,108 @@ static void cacheText(const std::wstring& t) {
     if (g_allText.size() > 4 * 1024 * 1024) g_allText.erase(0, g_allText.size() - 3 * 1024 * 1024);
 }
 
+// 上一次成功设到选区的颜色（相同就不要重复设，见 termSyncLine）
+// EM_SETCHARFORMAT(SCF_SELECTION) 会让 RichEdit 重排并重绘这段文本，
+// 每敲一个字符都设一次，整行就一直在闪。
+static COLORREF     g_appliedColor = 0xFFFFFFFF;  // 插入点当前生效的颜色
+static long         g_colorEnd     = -1;          // 该颜色文本的末尾位置（插入点在此可复用，不必重设）
+static void         termColorReset() { g_appliedColor = 0xFFFFFFFF; g_colorEnd = -1; }
+
+// 把插入点设成终端基准格式：字体 + 字号 + 字符集 + 当前颜色。
+//
+// 只设颜色是不够的。输入法上屏时 RichEdit/TSF 会往文档里塞自己的字体
+// （宋体等的 yHeight 比 Consolas 大），我们随后虽然把那几个字删掉了，
+// **插入点格式却留在了那个更大的字体上**，于是之后板子的所有输出都继承它——
+// 表现为「输入汉字后行距变大、后面输出的字也变大」，而且一直不恢复。
+// 所以每次写文本之前把字体/字号一起压实，颜色只是其中一项。
 static void termApplyColor() {
     if (!g_termReady) return;
     CHARFORMAT2W cf{};
     cf.cbSize = sizeof(cf);
-    cf.dwMask = CFM_COLOR;
+#ifdef TERM_FMT_OLD
+    cf.dwMask = CFM_COLOR;                    // 对照测试：只看颜色的老行为
+#else
+    cf.dwMask = CFM_FACE | CFM_SIZE | CFM_CHARSET | CFM_COLOR;
+#endif
+    cf.yHeight = g_fontPt * 20;
+    cf.bCharSet = DEFAULT_CHARSET;
+    lstrcpynW(cf.szFaceName, L"Consolas", LF_FACESIZE);
     cf.crTextColor = g_tcolor;
     SendMessageW(g_hView, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    g_appliedColor = g_tcolor;
+}
+
+// 文档字符数：GTL_NUMCHARS 按 \r 一个字符算，和 CHARRANGE 下标同一口径
+static long docChars() {
+    GETTEXTLENGTHEX gl{GTL_NUMCHARS | GTL_DEFAULT, 1200};
+    return (long)SendMessageW(g_hView, EM_GETTEXTLENGTHEX, (WPARAM)&gl, 0);
+}
+
+// 插入点必须停在「当前行末尾」。终端里光标跑到别处是没有意义的，
+// 但 RichEdit 是可编辑控件，会在这些情况下把插入点挪走：
+//   · 在输出区点一下（想选文字/顺手点窗口）→ 插入点落到点击位置
+//   · 输入法上屏后 syncForeignText() 删掉本地插入的字 → 插入点塌在删除处
+//   · Ctrl+A 全选之后又点了别处
+// 表现为「光标跑到屏幕中间、不在最后一行」。这里把它拉回行尾；
+// 用户正在框选（cpMin != cpMax）时不动，那是有意为了复制。
+static void termEnsureCaret() {
+    if (!g_hView || !g_termReady) return;
+    CHARRANGE cr{};
+    SendMessageW(g_hView, EM_EXGETSEL, 0, (LPARAM)&cr);
+    if (cr.cpMax != cr.cpMin) return;                       // 有选区：用户框选，别打断
+    long want = g_lcp + (long)g_lshow.size();
+    if (cr.cpMax == want) return;
+    dbgLog(L"caret fix: was=%ld want=%ld", (long)cr.cpMax, want);
+    CHARRANGE to{want, want};
+    SendMessageW(g_hView, EM_EXSETSEL, 0, (LPARAM)&to);
+    SendMessageW(g_hView, EM_SCROLLCARET, 0, 0);
+}
+
+// 当前行起点 + 已渲染长度 应当正好等于文档末尾（每次写完都维持这个不变量）。
+// 对不上说明文档被别的路径改过（切会话、外来文本、被裁剪），
+// 这时按旧锚点写会把字插到屏幕中间，所以只在「我们的行已经不在文末」这种
+// 安全情况下把锚点重新落到文末，并清掉已渲染缓存让它整行重画。
+static void termAnchorCheck() {
+    long end = docChars();
+    long want = g_lcp + (long)g_lshow.size();
+    if (end == want) return;
+    dbgLog(L"anchor drift: end=%ld want=%ld", end, want);
+    if (end < want) {                        // 我们的行被删掉了：重新落到文末重画
+        g_lcp = end;
+        g_lshow.clear();
+    }
 }
 
 // 把当前行按字节缓冲重画一遍
+//
+// 只替换「公共前缀之后的那一段」。
+// 早先的实现每次都把整行（含提示符 root@ATK-IMX6U:~#）选中后 EM_REPLACESEL，
+// 等于每敲一个字符就把整行删掉重写，屏幕上提示符和前文会一下一下地闪；
+// 现在按前缀求差集：在行尾追加时公共前缀就是整行，选区退化成插入点，
+// 只有真正改动的那几个字被重画，提示符不会再动。
 static void termSyncLine() {
     if (!g_hView || !g_termReady) return;
+    termAnchorCheck();
     std::wstring r = rxDecode(g_lb);
     if (r == g_lshow) return;
-    CHARRANGE cr{g_lcp, g_lcp + (long)g_lshow.size()};
+    size_t n = r.size() < g_lshow.size() ? r.size() : g_lshow.size();
+    size_t cp = 0;
+    while (cp < n && r[cp] == g_lshow[cp]) ++cp;
+    long s = g_lcp + (long)cp;
+    CHARRANGE cr{s, g_lcp + (long)g_lshow.size()};
+#ifdef TERM_TRACE
+    { CHARFORMAT2W q{}; q.cbSize = sizeof(q);
+      SendMessageW(g_hView, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&q);
+      FILE* f = fopen("term_trace.txt", "a");
+      if (f) { fprintf(f, "cp=%zu old=%zu new=%zu erase=%zu yH=%d mask=%08lx\n", cp, g_lshow.size(),
+                       r.size(), g_lshow.size() - cp, (int)q.yHeight, (unsigned long)q.dwMask); fclose(f); } }
+#endif
     SendMessageW(g_hView, EM_EXSETSEL, 0, (LPARAM)&cr);
-    termApplyColor();
-    viewReplace(r.c_str());
+    // 插入点紧接在同一颜色的文本后面时，格式天然就是对的，不必再设一次
+    if (g_tcolor != g_appliedColor || s != g_colorEnd) termApplyColor();
+    viewReplace(r.c_str() + cp);
     g_lshow = r;
+    g_colorEnd = s + (long)(r.size() - cp);
     SendMessageW(g_hView, EM_SCROLLCARET, 0, 0);
 }
 
@@ -630,6 +728,7 @@ static void termInsertTs() {
     viewReplace(ts.c_str());
     g_lcp += (long)ts.size();
     g_lshow.clear();
+    g_colorEnd = g_lcp;
 }
 
 static void termInsertBytes(const std::string& s) {
@@ -650,12 +749,14 @@ static void termCommitLine() {
     termApplyColor();
     viewReplace(L"\r");
     g_lcp = end + 1;
+    g_colorEnd = g_lcp;
     g_lb.clear();
     g_lc = 0;
     g_bsPend = 0;
     g_bsSkip = 0;
     g_tsNeed = true;                    // 新行开始，下一次输出补时间戳
     g_lshow.clear();
+    termColorReset();                   // 新行的插入点格式要重新设一次
     SendMessageW(g_hView, EM_SCROLLCARET, 0, 0);
 }
 
@@ -684,6 +785,7 @@ static void termClearAll() {
     g_lshow.clear();
     g_lcp = 0;
     g_tsNeed = true;
+    termColorReset();
     { std::lock_guard<std::mutex> lk(g_textMtx); g_allText.clear(); }
 }
 
@@ -950,7 +1052,7 @@ static void applySessionView(Session* t) {
     g_lb.clear();
     g_lc = 0;
     g_lshow.clear();
-    g_lcp = (long)viewTextLen(g_hView);
+    g_lcp = caretToEnd();
     g_tsNeed = (t->lineShow.empty() && t->lineBuf.empty());   // 上一行已收尾才补时间戳
     lineReset();
     // 整屏换掉不是用户输入：刷新「外来文本」基准，并在一小段时间内直接忽略外来文本判定，
@@ -960,12 +1062,16 @@ static void applySessionView(Session* t) {
     g_expect = viewText();
     g_selfEdit = false;
     g_foreignGuard = GetTickCount() + 800;
+    // 从 SSH 终端切回串口会话时，必须重排一次：把别的会话的终端控件收起来、
+    // 让 RichEdit 重新显示，否则 SSH 终端窗口一直盖在上面，看起来像「没切换」
+    if (g_hwnd) layout(g_hwnd);
+    termEnsureCaret();                     // 切过去后插入点落在最后一行行尾
 }
 
 // 切换会话：先把当前画面存进旧会话，再把目标会话的画面装载进来
 static void switchSession(Session* t) {
     if (!t || t == g_cur || !g_hView) return;
-    if (g_cur) {
+    if (g_cur && g_cur->type != CONN_SSH) {   // SSH 画面在终端控件里，别拿 RichEdit 覆盖它
         viewSaveRtf(g_cur->rtf);
         { std::lock_guard<std::mutex> lk(g_textMtx); g_cur->allText = g_allText; }
         g_cur->lineBuf  = g_lb;
@@ -984,6 +1090,9 @@ static void switchSession(Session* t) {
     updateStatus();
     syncMenuChecks();
     if (g_hSide) InvalidateRect(g_hSide, nullptr, TRUE);
+    // 焦点跟着画面走：SSH 喂终端控件，串口喂 RichEdit，否则切过去敲键盘没人接
+    if (t->type == CONN_SSH && t->term) t->term->focus();
+    else if (g_hView) SetFocus(g_hView);
 }
 
 // 左侧会话列表：每行一个会话（圆点 + 名字 + 状态），底部一行「新建会话」
@@ -1304,6 +1413,20 @@ struct Peer {
 static std::vector<std::shared_ptr<Peer>> g_peers;
 static std::mutex g_peersMtx;
 
+// 接管服务真正能写的串口：优先 g_hubSess，退化到第一个本地串口会话。
+// 千万不能用 g_cur —— 本机自环测试时当前会话就是「远程串口」客户端，
+// 写 g_cur 等于把数据发回它自己的 socket，会自己跟自己打乒乓。
+static Session* hubPort() {
+    if (g_hubSess && g_hubSess->on && !g_hubSess->isRemote &&
+        g_hubSess->type == CONN_SERIAL && g_hubSess->ser.isOpen())
+        return g_hubSess;
+    for (auto& sp : g_sess) {
+        Session* q = sp.get();
+        if (q->on && !q->isRemote && q->type == CONN_SERIAL && q->ser.isOpen()) return q;
+    }
+    return nullptr;
+}
+
 static void broadcastLine(const std::string& line, Peer* skip) {
     std::vector<std::shared_ptr<Peer>> copy;
     {
@@ -1327,14 +1450,19 @@ static void postToGui(UINT msg, void* payload) {
     if (g_hwnd) PostMessageW(g_hwnd, msg, 0, (LPARAM)payload);
 }
 
+static void postToGuiId(UINT msg, WPARAM id, void* payload) {
+    if (g_hwnd) PostMessageW(g_hwnd, msg, id, (LPARAM)payload);
+}
+
 static void postText(UINT msg, const std::wstring& s) {
     postToGui(msg, new std::wstring(s));
 }
 
 static void peerThread(std::shared_ptr<Peer> p) {
+    Session* hp0 = hubPort();
     p->sendLine("{\"t\":\"meta\",\"msg\":\"已连接到枢纽\",\"port\":\"" +
-                wideToUtf8(g_cur ? g_cur->name : g_portName) +
-                "\",\"baud\":" + std::to_string(g_cur ? g_cur->baud : g_baud) + "}");
+                wideToUtf8(hp0 ? hp0->name : g_portName) +
+                "\",\"baud\":" + std::to_string(hp0 ? hp0->baud : g_baud) + "}");
     std::string acc;
     char tmp[4096];
     while (g_srvRun) {
@@ -1352,13 +1480,25 @@ static void peerThread(std::shared_ptr<Peer> p) {
                 std::string bytes((const char*)vb.data(), vb.size());
                 std::string src = jsonGetStr(line, "src");
                 if (src.empty()) src = "agent";
-                if (!serialWrite(bytes)) {
+                // 写「持有串口的那条会话」，不是 g_cur（本机自环时 g_cur 就是客户端自己）
+                Session* hp = hubPort();
+                bool ok = false;
+                if (hp) {
+                    std::lock_guard<std::mutex> lk(g_wrMtx);
+                    ok = hp->ser.write((const unsigned char*)bytes.data(), (int)bytes.size());
+                }
+                if (!ok) {
                     p->sendLine("{\"t\":\"meta\",\"msg\":\"串口未打开，数据被丢弃\"}");
                 } else {
-                    if (g_cur) g_cur->tx += (long long)bytes.size();
+                    hp->tx += (long long)bytes.size();
                     logLine(L"TX", bytes);
-                    auto* pr = new std::pair<std::string, std::string>(src, bytes);
-                    postToGui(WM_APP_TX, pr);
+                    // 「显示接管命令」只给 agent / CLI 注入用。远端 GUI 敲键是逐字节流，
+                    // 一个字符打一条带时间戳的标签行会把正常回显冲成"一字一行"，
+                    // 所以 gui 来源只往其它对端广播，不进本地画面（画面里本来就有板子回显）。
+                    if (src != "gui") {
+                        auto* pr = new std::pair<std::string, std::string>(src, bytes);
+                        postToGuiId(WM_APP_TX, (WPARAM)(hp ? hp->id : 0), pr);
+                    }
                     broadcastLine("{\"t\":\"tx\",\"b\":\"" +
                                       b64encode((const unsigned char*)bytes.data(), (int)bytes.size()) +
                                       "\",\"src\":\"" + jsonEscape(src) + "\"}",
@@ -1384,11 +1524,17 @@ static void peerThread(std::shared_ptr<Peer> p) {
 static void serverLoop() {
     sockaddr_in a{};
     a.sin_family = AF_INET;
-    a.sin_addr.s_addr = inet_addr("127.0.0.1");
+    // 绑 0.0.0.0：本机 127.0.0.1 / 本机网卡 IP / 局域网另一台 PC 都能连。
+    // 只绑 127.0.0.1 的话，连 192.168.x.x:7000 会直接被拒（之前就是这个坑）。
+    a.sin_addr.s_addr = INADDR_ANY;
     a.sin_port = htons(7000);
     if (bind(g_srv, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR) {
-        postText(WM_APP_META, L"接管服务端口 7000 被占用，本机 CLI 可能连不上");
-        return;
+        a.sin_addr.s_addr = inet_addr("127.0.0.1");     // 退一步只给本机用
+        if (bind(g_srv, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR) {
+            postText(WM_APP_META, L"接管服务端口 7000 被占用，本机 CLI 可能连不上");
+            return;
+        }
+        postText(WM_APP_META, L"接管服务只监听 127.0.0.1:7000（0.0.0.0 绑定失败）");
     }
     listen(g_srv, 8);
     while (g_srvRun) {
@@ -1503,6 +1649,7 @@ static void openPort(Session* s) {
     s->port = port;
     s->on = true;
     s->isRemote = false;
+    g_hubSess = s;                       // 接管服务对外提供的就是这个串口
     if (g_dtr) s->ser.setDtr(true);
     if (g_rts) s->ser.setRts(true);
     s->stopRead = false;
@@ -1522,6 +1669,10 @@ static bool openRemote(Session* s) {
     for (auto& c : ip) if (c == ' ') c = '\0';
     ip = ip.c_str();
 
+    {   // 远程会话可能比任何串口会话都先建，winsock 得自己确保初始化
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+    }
     SOCKET sk = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sk == INVALID_SOCKET) { appendRun(L"— 创建套接字失败 —\r\n", C_ERR); return false; }
 
@@ -1593,6 +1744,16 @@ static void closePort(Session* s = nullptr) {
     if (!s->isRemote) s->ser.close();
     s->isRemote = false;
     s->on = false;
+    if (g_hubSess == s) {               // 提供串口的会话断了，接管服务暂时没有可写的口
+        g_hubSess = nullptr;
+        for (auto& sp : g_sess) {
+            Session* q = sp.get();
+            if (q != s && q->on && !q->isRemote && q->type == CONN_SERIAL && q->ser.isOpen()) {
+                g_hubSess = q;
+                break;
+            }
+        }
+    }
     if (s == g_cur) {
         appendRun(L"— 连接已断开 —\r\n", C_SYS);
         updateStatus();
@@ -1868,6 +2029,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, D
                 }
                 dbgLog(L"IME_RESULT res=[%ls] start=%ld", res.c_str(), start);
                 g_imeBase = -1;
+                termColorReset();      // 输入法写进文档的字体不能被后面的输出继承
                 return r;
             }
             break;
@@ -1943,6 +2105,21 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, D
             showViewMenu(h);          // 右键：复制/粘贴/全选/清屏 + 编码、时间戳、日志等功能设置
             return 0;
 
+        case WM_SETFOCUS: {
+            // 切回来时插入点可能还停在别处，先让 RichEdit 处理完再归位
+            LRESULT r = DefSubclassProc(h, m, w, l);
+            termEnsureCaret();
+            return r;
+        }
+
+        case WM_LBUTTONUP: {
+            LRESULT r = DefSubclassProc(h, m, w, l);
+            // 单击（没有拖出选区）只会在 RichEdit 里挪走插入点，终端里没意义，退回行尾；
+            // 拖选/双击选词保持不动，那是为了复制
+            termEnsureCaret();
+            return r;
+        }
+
         case WM_PASTE: case WM_CUT: case WM_CLEAR: case WM_UNDO:
             return 0;
     }
@@ -2017,6 +2194,11 @@ static void syncForeignText() {
         for (wchar_t ch : ins) termTypeChar(ch);           // 真正发给串口
         g_imeEcho = ins;                                   // 吞掉可能的重复投递
     }
+    // 上面删字会把插入点塌在删除处（屏幕中间），这里退回行尾
+    termEnsureCaret();
+    // 被删掉的那段是输入法塞进来的，它的字体比 Consolas 大；
+    // 删完插入点格式可能还留着那份大字体，强制下一笔重新压实格式
+    termColorReset();
 }
 
 // ---------------- 字体 ----------------
@@ -2937,7 +3119,8 @@ static void connectSession(Session* s) {
     if (!s) s = g_cur;
     if (!s) return;
     if (s->type == CONN_REMOTE) {
-        stopServer();
+        // 注意：**不能** stopServer()。本机自环测试就是「COM3 会话提供接管服务 +
+        // 远程串口会话连自己 127.0.0.1:7000」，停掉服务等于把自己掐死。
         openRemote(s);
     } else if (s->type == CONN_SSH) {
         startSsh(s);
@@ -2974,7 +3157,8 @@ static void newSessionDialog() {
     syncMenuChecks();
     updateStatus();
     if (g_hSide) InvalidateRect(g_hSide, nullptr, TRUE);
-    if (g_hView) SetFocus(g_hView);
+    if (s->term) s->term->focus();          // SSH 会话要喂终端控件，别把焦点塞给隐藏的 RichEdit
+    else if (g_hView) SetFocus(g_hView);
 }
 
 // 关闭一条会话（断开并从列表移除）
@@ -3727,6 +3911,29 @@ static void showViewMenu(HWND h) {
 // ---------------- 主窗口 ----------------
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+#ifdef TERM_TRACE
+        // 自测用：模拟输入法把「大字体」留在插入点格式上（不写任何文字）
+        case WM_APP + 30: {
+            CHARRANGE end{-1, -1};
+            SendMessageW(g_hView, EM_EXSETSEL, 0, (LPARAM)&end);
+            CHARFORMAT2W cf{};
+            cf.cbSize = sizeof(cf);
+            cf.dwMask = CFM_FACE | CFM_SIZE;
+            cf.yHeight = g_fontPt * 2 * 20;                  // 双倍字号
+            lstrcpynW(cf.szFaceName, L"SimSun", LF_FACESIZE);
+            SendMessageW(g_hView, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+            return 0;
+        }
+        // 自测用：把插入点当前的字符格式写进 fmt.txt
+        case WM_APP + 31: {
+            CHARFORMAT2W q{};
+            q.cbSize = sizeof(q);
+            SendMessageW(g_hView, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&q);
+            FILE* f = fopen("fmt.txt", "a");
+            if (f) { fprintf(f, "yH=%d face=%ls\n", (int)q.yHeight, q.szFaceName); fclose(f); }
+            return 0;
+        }
+#endif
         case WM_CREATE:
             g_hwnd = hwnd;
             createControls(hwnd);
