@@ -122,6 +122,7 @@
 #define WM_APP_SSH_DATA (WM_APP + 6)   // SSH 收到的数据（std::string*）
 #define WM_APP_SSH_LOG  (WM_APP + 7)   // SSH 进度/错误（SshLog*）
 #define WM_APP_SSH_END  (WM_APP + 8)   // SSH 连接结束（std::wstring*）
+#define WM_APP_INPUT_RESET (WM_APP + 9) // 放弃本地未提交输入（AI 注入前清账，无参数）
 
 // 深色终端配色
 static const COLORREF C_BG     = RGB(0x1B, 0x1E, 0x24);
@@ -247,6 +248,11 @@ static std::atomic<int> g_peerCount{0};
 
 // 终端输入
 static std::wstring g_line;                 // 当前输入行
+// 本地还有多少字符「已敲出去但没回车」。接管服务写串口前必须知道这件事：
+// 串口就一根线，AI 的 "\r" 会把用户打了一半的命令提前提交掉
+// （实测 "echo ABC" 打到一半被 AI 写 "\r" → 板子执行了 "echo ABCpwd"）。
+// 跨线程只能读原子量，g_line 本身留在 GUI 线程里。
+static std::atomic<int> g_pendingKeys{0};
 static std::vector<unsigned char> g_lineLen;// g_line 每个字符实际发下去的字节数（汉字 3/2 字节，
                                             // 代理对记在高的那一半上，低半部记 0）
 static wchar_t g_hiSur = 0;                 // 攒着的高半代理，等低半部到齐再一起下发
@@ -910,12 +916,17 @@ static void appendRun(const std::wstring& text, COLORREF color) {
         if (g_cur->term) g_cur->term->writeText(text);
         return;
     }
+    // 当前行还没收尾（板子刚打出的提示符就停在行尾）时先把它定格，
+    // 否则 "◀ [AGENT] xxx" 会粘在你输入的内容后面，看起来像命令被改写了
+    if (!g_lshow.empty()) { termAnchorCheck(); termCommitLine(); cacheText(L"\r"); }
     cacheText(text);
     CHARRANGE crEnd{-1, -1};                            // -1 = 文末
     SendMessageW(g_hView, EM_EXSETSEL, 0, (LPARAM)&crEnd);
+    COLORREF oldTc = g_tcolor;
     g_tcolor = color;
     termApplyColor();
     viewReplace(text.c_str());
+    g_tcolor = oldTc;                                   // 恢复：板子后续输出还得用正常色
     CHARRANGE crCur{};
     SendMessageW(g_hView, EM_EXGETSEL, 0, (LPARAM)&crCur);
     g_lcp = crCur.cpMax;                                // 新行起点
@@ -1357,9 +1368,14 @@ static void updateStatus() {
         return;
     }
     if (curOn()) {
-        swprintf_s(buf, L"已连接 %ls @%d | %ls | 会话 %d | 接管 :7000(%d) | RX %lld B  TX %lld B",
-                   g_cur->name.c_str(), g_cur->baud, encName(), (int)g_sess.size(),
-                   (int)g_peerCount, rx, tx);
+        // 有 AI 连着时把话说白：串口是独占的，这时本地敲键盘会被接管命令打断
+        if ((int)g_peerCount > 0)
+            swprintf_s(buf, L"已连接 %ls @%d | %ls | 会话 %d | AI 接管中(%d)，本地输入仍可用但会被注入打断 | RX %lld B  TX %lld B",
+                       g_cur->name.c_str(), g_cur->baud, encName(), (int)g_sess.size(),
+                       (int)g_peerCount, rx, tx);
+        else
+            swprintf_s(buf, L"已连接 %ls @%d | %ls | 会话 %d | 接管 :7000(0) | RX %lld B  TX %lld B",
+                       g_cur->name.c_str(), g_cur->baud, encName(), (int)g_sess.size(), rx, tx);
     } else {
         swprintf_s(buf, L"未连接 %ls | 会话 %d | RX %lld B  TX %lld B | 会话菜单 → 新建会话 (Ctrl+N)",
                    g_cur ? g_cur->name.c_str() : L"", (int)g_sess.size(), rx, tx);
@@ -1396,6 +1412,10 @@ struct Peer {
     SOCKET s;
     std::mutex mtx;
     std::atomic<bool> alive{true};
+    // 它最后写进串口的字节是不是停在半行上（没带 \r/\n）。
+    // 断开时要替它收尾，否则板子会一直等你把那半条命令敲完——
+    // 表现就是"AI 断开后我敲字没反应/命令对不上"。
+    std::atomic<bool> openLine{false};
     explicit Peer(SOCKET so) : s(so) {}
     void sendLine(const std::string& line) {
         if (!alive) return;
@@ -1482,6 +1502,24 @@ static void peerThread(std::shared_ptr<Peer> p) {
                 if (src.empty()) src = "agent";
                 // 写「持有串口的那条会话」，不是 g_cur（本机自环时 g_cur 就是客户端自己）
                 Session* hp = hubPort();
+                // 串口只有一根线，本地键盘和 AI 共用同一个写通道。用户可能正打到一半
+                // 没回车，此时 AI 的 "\r" 会把那半截命令**提前提交**：
+                // 实测本地敲 "echo ABC" 未回车，AI 写 "pwd\r" → 板子执行 "echo ABCpwd"，
+                // 用户的输入被吞、命令也变了。若半截是 rm/cp 之类，等于被 AI 按了回车。
+                // 处理：先发 Ctrl-U 把板子上那行清掉，再让界面丢掉本地账本，然后才注入。
+                // src=="gui" 是另一台 GUI 的键盘转发，属于正常打字，不该被清掉。
+                if (hp && src != "gui" && g_pendingKeys.load() > 0) {
+                    {
+                        std::lock_guard<std::mutex> lk(g_wrMtx);
+                        unsigned char cu = 0x15;              // Ctrl-U：kill line
+                        hp->ser.write(&cu, 1);
+                    }
+                    g_pendingKeys = 0;
+                    postText(WM_APP_META,
+                             L"检测到未提交的输入，已按 Ctrl-U 清行，避免和接管命令拼成一条");
+                    postToGui(WM_APP_INPUT_RESET, nullptr);
+                    Sleep(40);                                // 给板子处理 Ctrl-U 的时间
+                }
                 bool ok = false;
                 if (hp) {
                     std::lock_guard<std::mutex> lk(g_wrMtx);
@@ -1491,6 +1529,8 @@ static void peerThread(std::shared_ptr<Peer> p) {
                     p->sendLine("{\"t\":\"meta\",\"msg\":\"串口未打开，数据被丢弃\"}");
                 } else {
                     hp->tx += (long long)bytes.size();
+                    if (!bytes.empty())
+                        p->openLine = (bytes.back() != '\r' && bytes.back() != '\n');
                     logLine(L"TX", bytes);
                     // 「显示接管命令」只给 agent / CLI 注入用。远端 GUI 敲键是逐字节流，
                     // 一个字符打一条带时间戳的标签行会把正常回显冲成"一字一行"，
@@ -1511,6 +1551,24 @@ static void peerThread(std::shared_ptr<Peer> p) {
     }
     p->alive = false;
     closesocket(p->s);
+    // 接管端走了，但它可能把板子留在半条命令上（最后写的字节没带回车）。
+    // 这时用户接着敲，字会粘在那半截后面，看起来就是"没反应/命令不对"。
+    // 替它补一个 Ctrl-U 清行，把提示符还给用户。
+    if (p->openLine.load()) {
+        Session* hp = hubPort();
+        if (hp && hp->ser.isOpen()) {
+            bool userTyping = (g_pendingKeys.load() > 0);
+            {
+                std::lock_guard<std::mutex> lk(g_wrMtx);
+                unsigned char cu = 0x15;
+                hp->ser.write(&cu, 1);
+            }
+            postText(WM_APP_META, userTyping
+                     ? L"接管端已断开：你的未提交输入和它留下的半截命令混在一起，已整行清掉"
+                     : L"接管端已断开，已自动清掉它留下的半截命令行");
+            if (userTyping) { g_pendingKeys = 0; postToGui(WM_APP_INPUT_RESET, nullptr); }
+        }
+    }
     {
         std::lock_guard<std::mutex> lk(g_peersMtx);
         g_peers.erase(std::remove_if(g_peers.begin(), g_peers.end(),
@@ -1844,7 +1902,7 @@ static void termSendBytes(const std::string& bytes, COLORREF color, const wchar_
 // 行编辑器（板子上的 readline/sh）是按**字节**退格的：一个汉字 UTF-8 是 3 字节、GBK 是 2 字节，
 // 少发一个就只是把字删掉一半（屏幕上看着像“退格删不动/删出乱码”）。
 // 所以这里给 g_line 每个字符记下它真正发出去的字节数，退格时按记录精确回退。
-static void lineReset() { g_line.clear(); g_lineLen.clear(); g_hiSur = 0; }
+static void lineReset() { g_line.clear(); g_lineLen.clear(); g_hiSur = 0; g_pendingKeys = 0; }
 
 static void lineRecord(const std::wstring& s) {   // 记录一串已发出的字符（含代理对合并）
     size_t i = 0;
@@ -1860,6 +1918,7 @@ static void lineRecord(const std::wstring& s) {   // 记录一串已发出的字
         g_line += unit;
         g_lineLen.push_back((unsigned char)b.size());
         if (unit.size() == 2) g_lineLen.push_back((unsigned char)0);   // 低半代理不占字节
+        g_pendingKeys++;                                               // 未提交的字符 +1
         i++;
     }
 }
@@ -1867,6 +1926,8 @@ static void lineRecord(const std::wstring& s) {   // 记录一串已发出的字
 // 弹掉最后一个字符，返回它发出去时的字节数（0 表示本地没有记录）
 static int linePop() {
     if (g_line.empty()) return 0;
+    int pend = g_pendingKeys.load();
+    if (pend > 0) g_pendingKeys = pend - 1;
     while (!g_lineLen.empty()) {
         unsigned char n = g_lineLen.back();
         g_lineLen.pop_back();
@@ -1913,6 +1974,7 @@ static void termTypeChar(wchar_t ch) {
         termSendBytes("\t", C_TX, nullptr);
         g_line.push_back(L'\t');
         g_lineLen.push_back(1);
+        g_pendingKeys++;
         return;
     }
     if (ch < 32) return;
@@ -4107,6 +4169,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_APP_PEER:
             updateStatus();
+            return 0;
+
+        case WM_APP_INPUT_RESET:
+            // AI 注入前已经给板子发了 Ctrl-U，本地那份「还没回车的输入」一起作废，
+            // 否则退格会按旧账本多发字节、上翻历史也会拿到一条根本没执行过的命令
+            lineReset();
             return 0;
 
         case WM_MEASUREITEM: {
