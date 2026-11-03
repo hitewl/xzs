@@ -133,6 +133,11 @@ void Terminal::setBounds(int x, int y, int w, int h) {
     int nr = (rc.bottom - 2 * padY_) / cellH_;
     if (nc < 20) nc = 20;
     if (nr < 5) nr = 5;
+#ifdef TERM_TRACE
+    { FILE* f = fopen("term_size.log", "a");
+      if (f) { fprintf(f, "setBounds(%d,%d %dx%d) cell=%dx%d -> %dx%d (was %dx%d)\n",
+                       x, y, w, h, cellW_, cellH_, nc, nr, cols_, rows_); fclose(f); } }
+#endif
     if (nc != cols_ || nr != rows_) resizeGrid(nc, nr);
 }
 

@@ -1087,7 +1087,10 @@ void SshClient::write(const std::string& bytes) {
 }
 
 void SshClient::resize(int cols, int rows) {
-    if (!p->ready) return;
+    // 即使 shell 还没开好也要记下来：界面刚起来时窗口尺寸往往还没定，
+    // 这时算出的行列数（常见是下限 20x5）如果直接丢掉，pty 就会一直停在
+    // 那个尺寸上，表现是终端里文字行距被拉得很大、命令回显乱折行。
+    // 这里存下最新值，openShell 之后 loop 会补发一次 window-change。
     p->cols = cols;
     p->rows = rows;
     p->sizeDirty = true;

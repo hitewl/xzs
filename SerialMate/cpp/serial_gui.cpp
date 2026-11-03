@@ -366,6 +366,8 @@ static std::wstring rxDecode(const std::string& s) {
 // 本地字符 -> 要发到串口的字节（同上，跟着当前码位走）
 static std::string txEncode(const std::wstring& w) {
     if (w.empty()) return "";
+    // SSH 走的是标准终端协议，编码固定 UTF-8，不吃串口那边的 GBK 设置
+    if (g_cur && g_cur->type == CONN_SSH) return wideToUtf8(w);
     if (g_rxEnc == 2) {
         int n = WideCharToMultiByte(936, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
         if (n <= 0) return "";
@@ -1885,6 +1887,23 @@ static void stopSsh(Session* s) {
 // ---------------- 终端输入 ----------------
 static void termSendBytes(const std::string& bytes, COLORREF color, const wchar_t* tag) {
     if (bytes.empty()) return;
+    // SSH 会话必须单独走 ssh 通道。
+    // 原来这里只有「串口/远程串口」一条路（serialWrite），SSH 会话下 serialWrite 看到
+    // isRemote=false、串口没打开就直接 false，于是快捷命令（按钮、右键执行、
+    // 文本模式双击）全部报「— 发送失败 —」。键盘打字能用的原因是它走的是
+    // Terminal 的 onInput 回调，压根没经过这个函数。
+    if (g_cur && g_cur->type == CONN_SSH) {
+        if (!g_cur->ssh || !g_cur->ssh->alive()) {
+            appendRun(L"— SSH 会话未连接 —\r\n", C_ERR);
+            return;
+        }
+        g_cur->ssh->write(bytes);
+        g_cur->tx += (long long)bytes.size();
+        logLine(L"TX", bytes);
+        if (tag) appendRun(tag + rxDecode(bytes) + L"\r\n", color);
+        updateStatus();
+        return;
+    }
     if (!curOn()) {
         appendRun(L"— 未连接，请用 会话 → 新建会话(Ctrl+N) 建立连接 —\r\n", C_ERR);
         return;
@@ -2582,6 +2601,11 @@ static void layout(HWND hwnd) {
     for (auto& sp : g_sess)
         if (sp->term) sp->term->showWindow(false);
     if (sshMode && g_cur->term) {
+#ifdef TERM_TRACE
+        { FILE* f = fopen("term_size.log", "a");
+          if (f) { fprintf(f, "layout W=%d H=%d side=%d keys=%d viewW=%d viewH=%d top=%d\n",
+                           W, H, sideW, keysW, viewW, viewH, top); fclose(f); } }
+#endif
         g_cur->term->setBounds(8 + sideW + 6, top, viewW, viewH);
         g_cur->term->showWindow(true);
         ShowWindow(g_hView, SW_HIDE);
@@ -2666,7 +2690,14 @@ static void layoutKeysOnly() {
         if (needW > curW + 1) {
             SetWindowPos(g_hView, nullptr, 8 + sideW + 6, top, needW, viewH,
                          SWP_NOZORDER | SWP_NOACTIVATE);
-            if (g_cur && g_cur->term) g_cur->term->setBounds(8 + sideW + 6, top, needW, viewH);
+            if (g_cur && g_cur->term) {
+#ifdef TERM_TRACE
+                { FILE* f = fopen("term_size.log", "a");
+                  if (f) { fprintf(f, "keysOnly W=%d H=%d keysW=%d keysX=%d needW=%d curW=%d viewH=%d\n",
+                                   W, H, keysW, keysX, needW, curW, viewH); fclose(f); } }
+#endif
+                g_cur->term->setBounds(8 + sideW + 6, top, needW, viewH);
+            }
         }
     }
     if (g_hKeysBtn) {
@@ -3455,7 +3486,10 @@ static void runShortcut(int i) {
     if (i < 0 || i >= (int)g_keys.size()) return;
     termSendBytes(txEncode(g_keys[i]) + "\r", C_TX, nullptr);
     lineReset();
-    if (g_hView) SetFocus(g_hView);
+    // 焦点要还给它真正显示的那个控件：SSH 会话的显示区是 Terminal，
+    // 原来无条件 SetFocus(g_hView)，会把手写焦点交给一个被隐藏的 RichEdit。
+    if (g_cur && g_cur->type == CONN_SSH && g_cur->term) g_cur->term->focus();
+    else if (g_hView) SetFocus(g_hView);
 }
 
 static void keyAdd() {
@@ -3995,6 +4029,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (f) { fprintf(f, "yH=%d face=%ls\n", (int)q.yHeight, q.szFaceName); fclose(f); }
             return 0;
         }
+        // 自测用：验证快捷命令在 SSH 会话下能不能发出去。
+        // +40 = 按钮/右键「执行此命令」那条路（runShortcut）
+        // +41 = 文本模式双击那条路（keyTextRunLine）
+        case WM_APP + 40: runShortcut(0); return 0;
+        case WM_APP + 41:
+            if (g_hKeyText && !g_keys.empty()) {
+                SetWindowTextW(g_hKeyText, g_keys[0].c_str());
+                keyTextRunLine(0);
+            }
+            return 0;
 #endif
         case WM_CREATE:
             g_hwnd = hwnd;
@@ -4385,7 +4429,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_sttyAdapt = !g_sttyAdapt;
                     saveSettings();
                     syncMenuChecks();
-                    if (g_sttyAdapt && curOn())
+                    if (g_sttyAdapt && curOn() && g_cur->type != CONN_SSH)
                         termSendBytes("\x15shopt -s checkwinsize 2>/dev/null; stty cols 400 rows 100 2>/dev/null; COLUMNS=400; LINES=100; export COLUMNS LINES\r", C_TX, nullptr);
                     return 0;
                 case IDM_PORT_DTR:
@@ -4488,7 +4532,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 KillTimer(hwnd, IDT_STTY);
                 // 让板子的 readline 知道终端很宽：超宽命令不会自己折行，
                 // 避免它按 80 列重绘而与我们不换行的显示错位
-                if (g_sttyAdapt && curOn())
+                if (g_sttyAdapt && curOn() && g_cur->type != CONN_SSH)
                     termSendBytes("\x15shopt -s checkwinsize 2>/dev/null; stty cols 400 rows 100 2>/dev/null; COLUMNS=400; LINES=100; export COLUMNS LINES\r", C_TX, nullptr);
                 return 0;
             }
