@@ -225,12 +225,19 @@ public:
         dcb.fInX = FALSE;
         if (!SetCommState(h_, &dcb)) { err = L"SetCommState 失败"; close(); return false; }
         COMMTIMEOUTS to{};
-        // 轮询式读：最多阻塞 50ms 就把已收到的数据交回。
-        // 注意不能用 ReadIntervalTimeout=MAXDWORD——部分 USB 串口驱动（如 CH340）
-        // 会忽略总超时，一直阻塞到有数据，导致读线程长期占住串口句柄。
-        to.ReadIntervalTimeout = 50;
+        // 读超时必须给得**小**，否则打字会一顿一顿的。
+        //
+        // ReadIntervalTimeout 的语义是「两个字节之间最多再等多久」：收到第 1 个
+        // 字节后驱动还要盯着线路等这么久才把数据交上来。原来是 50ms，加上 USB
+        // 转串口芯片自己的 latency（CH340/FT232 默认 16ms），一次「敲键→板子回显」
+        // 的往返被硬生生拉长到 ~80ms，表现就是「键盘已经敲下去了，屏幕慢半拍」，
+        // 退格尤其明显（要先等回显字节上来才能重画）。
+        // 改成 2ms 后回显几乎立刻可见；连续大块输出时因为字节间隔远小于 2ms，
+        // 仍然会攒满缓冲一次返回，不会降低吞吐。
+        // 仍不用 MAXDWORD——部分 CH340 驱动会忽略总超时一直阻塞。
+        to.ReadIntervalTimeout = 2;
         to.ReadTotalTimeoutMultiplier = 0;
-        to.ReadTotalTimeoutConstant = 50;
+        to.ReadTotalTimeoutConstant = 20;
         to.WriteTotalTimeoutMultiplier = 0;
         to.WriteTotalTimeoutConstant = 500;
         SetCommTimeouts(h_, &to);

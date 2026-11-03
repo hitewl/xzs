@@ -76,6 +76,7 @@
 #define IDM_TOOL_STTY        2201   // 打开时适配终端宽度
 #define IDT_STTY             1      // 一次性定时器
 #define IDT_IME              2      // 输入法外来文本防抖同步
+#define IDT_STATUS           3      // 状态栏节流后的补刷
 
 #define IDM_VIEW_BIGGER      4001
 #define IDM_VIEW_SMALLER     4002
@@ -91,6 +92,7 @@
 #define IDM_LOG_SAVE         4030   // 串口日志开关
 #define IDM_LOG_DIR          4031   // 设置日志目录
 #define IDM_LOG_OPEN         4032   // 打开日志目录
+#define IDM_LOCAL_ECHO       4033   // 本地回显开关（按键即时显示）
 #define IDM_SIDE_TOGGLE      4040   // 左侧会话栏 显示/收起
 #define IDM_SIDE_CONN        4041   // 左侧栏右键：连接该会话
 #define IDM_SESS_CLOSE       4042   // 左侧栏右键：关闭该会话
@@ -287,6 +289,7 @@ static HBRUSH   g_brushMenu = nullptr, g_brushDlg = nullptr;
 static bool g_showAgent = true;
 static bool g_sttyAdapt = true;   // 打开会话后发 stty 让板子知道终端很宽（长命令不错位）
 static bool g_serve = true;
+static bool g_localEcho = true;   // 按键本地先显示，不等板子回显（关掉则完全靠回显）
 static bool g_dtr = false, g_rts = false;
 
 // 串口显示/发送编码：0=自动（UTF-8 优先，失败回退 GBK） 1=UTF-8  2=GBK(文本/ANSI)
@@ -416,6 +419,7 @@ static void loadSettings() {
         else if (k == L"enc") g_rxEnc = _wtoi(v.c_str());
         else if (k == L"logsave") g_logSave = (v == L"1");
         else if (k == L"logdir") g_logDir = v;
+        else if (k == L"lcho") g_localEcho = (v == L"1");
         else if (k == L"side") g_sideOn = (v == L"1");
         else if (k == L"keys") g_keysOn = (v == L"1");
         else if (k == L"keyw") g_keysW = _wtoi(v.c_str());
@@ -450,8 +454,8 @@ static void saveSettings() {
              g_sshHost.c_str(), g_sshPort, g_sshUser.c_str(), g_sshPass.c_str(), (int)g_connType);
     fwprintf(f, L"telhost=%ls\ntelport=%d\nenc=%d\n",
              g_telHost.c_str(), g_telPort, g_rxEnc);
-    fwprintf(f, L"logsave=%d\nlogdir=%ls\nside=%d\nkeys=%d\nkeyw=%d\n",
-             g_logSave ? 1 : 0, g_logDir.c_str(), g_sideOn ? 1 : 0,
+    fwprintf(f, L"logsave=%d\nlogdir=%ls\nlcho=%d\nside=%d\nkeys=%d\nkeyw=%d\n",
+             g_logSave ? 1 : 0, g_logDir.c_str(), g_localEcho ? 1 : 0, g_sideOn ? 1 : 0,
              g_keysOn ? 1 : 0, g_keysW);
     fwprintf(f, L"mpt=%d\ndpt=%d\nmfg=%u\nmbg=%u\nmsel=%u\ndfg=%u\ndbg=%u\n",
              g_menuPtIdx, g_dlgPtIdx, (unsigned)g_menuFg, (unsigned)g_menuBg,
@@ -535,6 +539,18 @@ static std::wstring g_csi;                // CSI 参数缓存
 static COLORREF     g_tcolor  = C_RX;     // 当前输出颜色
 static int          g_bsPend  = 0;        // 本地已删、等待板子回显的 0x08 个数（吞掉避免重复删）
 static int          g_bsSkip  = 0;        // 0=正常 1=刚吞掉 0x08（可能是 "\b \b" 前半） 2=已吞空格
+
+// —— 本地回显 ——
+// 串口链路是「我们发→板子收→板子回显→我们收」，一来一回几十毫秒（USB 转串口
+// 芯片的 latency timer 占大头）。完全靠板子回显，敲键就会慢半拍，退格更明显。
+// 所以按键先在本地画出来（零延迟），板子随后把同样的字节回显回来时再丢掉。
+// g_echoQ 存「本地已画、还没被回显确认」的原始字节，按**内容**逐字节比对：
+// 只认一模一样的字节，一旦对不上（板子关着 echo、或者已经开始打命令输出），
+// 立刻清空队列按正常输出处理——早先用计数的方式在 `stty -echo` 下会把
+// `/home/root` 的前几个字节当成回显吃掉，屏幕上就成 "me/root"。
+static std::string  g_echoQ;
+static DWORD        g_echoStamp = 0;
+
 
 static void termSendBytes(const std::string& bytes, COLORREF color, const wchar_t* tag);
 static void appendRun(const std::wstring& text, COLORREF color);
@@ -749,6 +765,28 @@ static void termInsertBytes(const std::string& s) {
     termSyncLine();
 }
 
+// 本地回显：把刚发出去的字节立刻画到屏幕上，不等板子返回。
+// 记下 g_echoQ，板子的回显字节随后到达时按内容比对丢弃（见 termFeed）。
+//
+// 例外：密码/口令提示行不回显。板子在这类提示下会关掉 echo，我们若抢先画出来，
+// 密码就明文留在屏幕上了（真正靠回显时它本来就是不显示的）。
+static bool echoSensitive() {
+    if (g_lshow.size() < 6) return false;
+    size_t from = g_lshow.size() > 24 ? g_lshow.size() - 24 : 0;
+    std::wstring tail = g_lshow.substr(from);
+    for (auto& c : tail) c = towlower(c);
+    return tail.find(L"assword") != std::wstring::npos ||
+           tail.find(L"密码")     != std::wstring::npos ||
+           tail.find(L"口令")     != std::wstring::npos;
+}
+
+static void termLocalEcho(const std::string& b) {
+    if (!g_localEcho || b.empty() || echoSensitive()) return;
+    g_echoQ += b;
+    g_echoStamp = GetTickCount();
+    termInsertBytes(b);
+}
+
 // 换行：把当前行定格
 static void termCommitLine() {
     long end = g_lcp + (long)g_lshow.size();
@@ -762,6 +800,7 @@ static void termCommitLine() {
     g_lc = 0;
     g_bsPend = 0;
     g_bsSkip = 0;
+    g_echoQ.clear();
     g_tsNeed = true;                    // 新行开始，下一次输出补时间戳
     g_lshow.clear();
     termColorReset();                   // 新行的插入点格式要重新设一次
@@ -790,6 +829,9 @@ static void termClearAll() {
     g_selfEdit = false;
     g_lb.clear();
     g_lc = 0;
+    g_bsPend = 0;
+    g_bsSkip = 0;
+    g_echoQ.clear();
     g_lshow.clear();
     g_lcp = 0;
     g_tsNeed = true;
@@ -899,13 +941,25 @@ static void termFeed(const std::string& bytes) {
         if (g_esc == 3) { if (c == 0x07) g_esc = 0; else if (c == 0x1B) g_esc = 1; continue; }
         if (g_esc == 4) { g_esc = 0; continue; }
 
-        if (c == 0x1B)        { flush(); g_esc = 1; }
-        else if (c == '\r')   { flush(); g_lc = 0; }
-        else if (c == '\n')   { flush(); termCommitLine(); }
+        if (c == 0x1B)        { flush(); g_esc = 1; g_echoQ.clear(); }
+        else if (c == '\r')   { flush(); g_lc = 0; g_echoQ.clear(); }
+        else if (c == '\n')   { flush(); termCommitLine(); g_echoQ.clear(); }
         else if (c == 0x08)   { flush(); if (g_bsPend > 0) { g_bsPend--; g_bsSkip = 1; } else termEchoBackspace(); }
         else if (c == '\t')   { flush(); termInsertBytes(std::string(8 - (g_lc % 8), ' ')); }
         else if (c < 0x20 || c == 0x7F) { /* 其余控制字符丢弃，不再显示成方块 */ }
-        else run.push_back((char)c);
+        else {
+            // 这些字节如果是我们自己刚敲下去、已经在屏幕上画过的，就丢掉。
+            // 按内容比对：对不上说明不是回显（板子关了 echo，或者这边已经开始
+            // 吐命令结果），立刻停手，否则后面的输出会被吃掉开头几个字节。
+            if (!g_echoQ.empty()) {
+                if (g_echoQ[0] == (char)c && GetTickCount() - g_echoStamp <= 400) {
+                    g_echoQ.erase(0, 1);       // 本地已显示，回显丢弃
+                    continue;
+                }
+                g_echoQ.clear();
+            }
+            run.push_back((char)c);
+        }
     }
     flush();
 }
@@ -934,6 +988,7 @@ static void appendRun(const std::wstring& text, COLORREF color) {
     g_lcp = crCur.cpMax;                                // 新行起点
     g_lb.clear();
     g_lc = 0;
+    g_echoQ.clear();                                     // 本地提示行插在中间，回显账本作废
     g_lshow.clear();
     SendMessageW(g_hView, EM_SCROLLCARET, 0, 0);
 }
@@ -1138,10 +1193,26 @@ static int sideHit(int y) {
     return -1;
 }
 
+// 侧栏整块重画不便宜（擦背景 + 逐个会话量文字画圆点），而 updateStatus 每收到
+// 一段串口数据就会调它一次。会话列表、名字、连线状态都没变时，没必要重画。
+static std::wstring g_sideSig;
+static bool         g_sideSigOn = false;
+
 static void updateSide() {
     if (!g_hSide || !g_hSideBtn) return;
-    if (!g_sideOn) SetWindowTextW(g_hSideBtn, L"»");
-    else           SetWindowTextW(g_hSideBtn, L"«");
+    SetWindowTextW(g_hSideBtn, g_sideOn ? L"«" : L"»");
+    std::wstring sig;
+    sig.reserve(g_sess.size() * 12);
+    for (auto& s : g_sess) {
+        sig += (s->on ? L'1' : L'0');
+        sig += std::to_wstring(s->id);
+        sig += s->name;
+        sig += L',';
+    }
+    if (g_cur) { sig += L'|'; sig += std::to_wstring(g_cur->id); }
+    if (sig == g_sideSig && g_sideSigOn == g_sideOn) return;
+    g_sideSig = sig;
+    g_sideSigOn = g_sideOn;
     InvalidateRect(g_hSide, nullptr, TRUE);   // 自绘，重画即可
 }
 
@@ -1355,7 +1426,20 @@ static LRESULT CALLBACK SideProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, D
     return DefSubclassProc(h, m, w, l);
 }
 
+// 状态栏在「打字 + 回显 + 命令输出」时会被打到几十次每秒，每次都要
+// SetWindowText + 重画侧栏，白白拖慢按键响应。这里 100ms 合并一次，
+// 尾巴用一次性定时器补刷，所以数字最终仍然准确。
+static DWORD g_stTick  = 0;
+static bool  g_stDirty = false;
+
 static void updateStatus() {
+    DWORD now = GetTickCount();
+    if (now - g_stTick < 100) {
+        if (!g_stDirty) { g_stDirty = true; SetTimer(g_hwnd, IDT_STATUS, 120, nullptr); }
+        return;
+    }
+    g_stTick  = now;
+    g_stDirty = false;
     wchar_t buf[512];
     long long rx = g_cur ? g_cur->rx : 0, tx = g_cur ? g_cur->tx : 0;
     if (g_cur && g_cur->type == CONN_SSH) {
@@ -2007,6 +2091,7 @@ static void termTypeChar(wchar_t ch) {
     unit.push_back(ch);
     std::string b = txEncode(unit);
     if (b.empty()) return;
+    termLocalEcho(b);                    // 先画到屏幕上，键盘手感不再受链路延迟影响
     termSendBytes(b, C_TX, nullptr);
     lineRecord(unit);
 }
@@ -3985,6 +4070,7 @@ static void showViewMenu(HWND h) {
     mAddMenu(m, MF_POPUP, (UINT_PTR)mEnc, L"串口编码");
     mAddMenu(m, MF_STRING | (g_showTs ? MF_CHECKED : 0), IDM_VIEW_TS, L"显示时间戳");
     mAddMenu(m, MF_STRING | (g_showAgent ? MF_CHECKED : 0), IDM_VIEW_AGENT, L"显示接管命令");
+    mAddMenu(m, MF_STRING | (g_localEcho ? MF_CHECKED : 0), IDM_LOCAL_ECHO, L"按键即时显示（本地回显）");
     mAddMenu(m, MF_STRING | (g_sideOn ? MF_CHECKED : 0), IDM_SIDE_TOGGLE, L"显示会话列表");
     mAddMenu(m, MF_STRING | (g_keysOn ? MF_CHECKED : 0), IDM_KEYS_TOGGLE, L"显示快捷命令栏");
     mAddMenu(m, MF_SEPARATOR, 0, nullptr);
@@ -4479,6 +4565,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_VIEW_SAVE:
                     saveLog(hwnd);
                     return 0;
+                case IDM_LOCAL_ECHO:
+                    g_localEcho = !g_localEcho;
+                    saveSettings();
+                    appendRun(g_localEcho ? L"— 按键即时显示：开（本地先画，回显到达时丢弃） —\r\n"
+                                          : L"— 按键即时显示：关（完全靠板子回显） —\r\n", C_SYS);
+                    if (g_hView) SetFocus(g_hView);
+                    return 0;
                 case IDM_LOG_SAVE:
                     g_logSave = !g_logSave;
                     if (!g_logSave) closeLog();
@@ -4526,6 +4619,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 dbgLog(L"IDT_IME composing=%d", composing ? 1 : 0);
                 if (composing) SetTimer(hwnd, IDT_IME, 300, nullptr);        // 还在拼写，继续等
                 else syncForeignText();
+                return 0;
+            }
+            if (wp == IDT_STATUS) {
+                KillTimer(hwnd, IDT_STATUS);
+                g_stDirty = false;
+                g_stTick  = 0;              // 让下面这次一定刷进去
+                updateStatus();
                 return 0;
             }
             if (wp == IDT_STTY) {
