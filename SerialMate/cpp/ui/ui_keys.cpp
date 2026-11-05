@@ -489,8 +489,14 @@ LRESULT CALLBACK KeyProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR
     switch (m) {
         // 同侧栏：快捷栏底部有「导入/导出」贴底绘制，窗口放大时系统只重绘新露出
         // 的区域，旧位置会留残影。尺寸一变就整块重绘。
+        //
+        // UpdateWindow 不能省：栏是 SS_OWNERDRAW，实际绘制在父窗口的 WM_DRAWITEM 里，
+        // 而 InvalidateRect 只是标脏、等消息队列空闲才画。拖动左边缘加宽时每帧都在
+        // 改尺寸，绘制永远排在鼠标消息后面 → 新盖住终端的那一条来不及画，露出下层
+        // 终端的深色背景（看到「黑框」）。这里强制同步走一次 WM_PAINT。
         case WM_SIZE:
             InvalidateRect(h, nullptr, TRUE);
+            UpdateWindow(h);
             return 0;
         case WM_SETCURSOR: {                       // 左边缘显示左右箭头
             POINT pt; GetCursorPos(&pt);

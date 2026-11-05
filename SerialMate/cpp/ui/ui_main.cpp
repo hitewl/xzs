@@ -302,6 +302,11 @@ void layout(HWND hwnd) {
         ShowWindow(g_hView, SW_HIDE);
     } else if (g_hView) {
         ShowWindow(g_hView, SW_SHOW);
+        // 终端必须待在 z 序最底：拖动右侧栏加宽时栏会直接盖到终端上，
+        // 如果终端在上层，栏新覆盖的那块就被终端压住，看起来像「拖出来一块黑框」。
+        // ShowWindow(SW_SHOW) 本身会把窗口提到 z 序顶部，所以这里显式沉底。
+        SetWindowPos(g_hView, HWND_BOTTOM, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
     int keysX = 8 + sideW + 6 + viewW + 6;
@@ -381,8 +386,9 @@ void layoutKeysOnly() {
         int curW  = vr.right - vr.left;
         int needW = keysX - 6 - (8 + sideW + 6);
         if (needW > curW + 1) {
-            SetWindowPos(g_hView, nullptr, 8 + sideW + 6, top, needW, viewH,
-                         SWP_NOZORDER | SWP_NOACTIVATE);
+            // HWND_BOTTOM：顺手把终端压回 z 序最底，右栏加宽时才不会被它盖住
+            SetWindowPos(g_hView, HWND_BOTTOM, 8 + sideW + 6, top, needW, viewH,
+                         SWP_NOACTIVATE);
             if (g_cur && g_cur->term) {
 #ifdef TERM_TRACE
                 { FILE* f = fopen("term_size.log", "a");
@@ -406,7 +412,11 @@ void layoutKeysOnly() {
     if (g_hKeysBar && g_keysOn) {
         SetWindowPos(g_hKeysBar, nullptr, keysX, top + kKeyTopH, keysW, viewH - kKeyTopH,
                      SWP_NOZORDER | SWP_NOACTIVATE);
-        InvalidateRect(g_hKeysBar, nullptr, TRUE);
+        // 同步重绘：SetWindowPos 之后系统还会补一次无效区处理，光靠 InvalidateRect
+        // （异步 WM_PAINT）在拖动中被鼠标消息一直推迟，新盖住终端的那条来不及画，
+        // 露出终端深色底。RDW_UPDATENOW 把这次绘制压到当前调用里完成。
+        RedrawWindow(g_hKeysBar, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
     }
     if (g_hKeyText && g_keyTextMode) {
         SetWindowPos(g_hKeyText, HWND_TOP, keysX + kHandleW + 6, top + kKeyTopH + 6,
