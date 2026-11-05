@@ -4,7 +4,7 @@
 //   窗口标题 / 关于框 / `serial_gui.exe --version` / exe 右键属性里的版本
 // 全工程不存在第二处硬编码的版本号。
 //
-// 升哪一位（详见 DEVELOP.md 第 6 节）：
+// 升哪一位（详见 DEVELOP.md 第 7 节）：
 //   MAJOR  不兼容变更：ini 键的语义变了、接管协议 JSON 字段变了、默认快捷键改了
 //   MINOR  新增功能：新会话类型、新菜单项、新协议命令，旧的用法照旧可用
 //   PATCH  修 bug、显示/性能优化，对外行为不变
@@ -12,7 +12,7 @@
 #define SM_VERSION_H
 
 #define SM_VER_MAJOR 1
-#define SM_VER_MINOR 0
+#define SM_VER_MINOR 1
 #define SM_VER_PATCH 0
 
 // 宏 -> 字符串必须两层展开，否则拿到的是宏名本身
