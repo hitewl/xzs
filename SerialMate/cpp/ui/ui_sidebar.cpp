@@ -252,6 +252,12 @@ void showSideMenu(POINT pt) {
 
 LRESULT CALLBACK SideProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
     switch (m) {
+        // 侧栏的内容是「贴底」排的（新建会话贴窗口底部、列表按剩余高度裁剪）。
+        // 窗口变大时系统只重绘新露出来的那一块，旧位置画过的「新建会话」会留在
+        // 原地，放大窗口后就会出现一叠重复条目。这里强制整块重绘。
+        case WM_SIZE:
+            InvalidateRect(h, nullptr, TRUE);
+            return 0;
         case WM_LBUTTONUP: {
             int hit = sideHit((short)HIWORD(l));
             if (hit >= 0) switchSession(g_sess[hit].get());

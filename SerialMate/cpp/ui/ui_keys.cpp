@@ -487,6 +487,11 @@ void showKeyMenu(POINT pt, int idx) {
 
 LRESULT CALLBACK KeyProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
     switch (m) {
+        // 同侧栏：快捷栏底部有「导入/导出」贴底绘制，窗口放大时系统只重绘新露出
+        // 的区域，旧位置会留残影。尺寸一变就整块重绘。
+        case WM_SIZE:
+            InvalidateRect(h, nullptr, TRUE);
+            return 0;
         case WM_SETCURSOR: {                       // 左边缘显示左右箭头
             POINT pt; GetCursorPos(&pt);
             ScreenToClient(h, &pt);
