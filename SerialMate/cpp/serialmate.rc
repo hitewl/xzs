@@ -1,0 +1,32 @@
+// serialmate.rc - Windows 版本资源（只放版本信息，图标走系统默认）
+// 版本号来自 version.h，改数字即可，不要在这里写死。
+#include <winver.h>
+#include "version.h"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION SM_VER_MAJOR,SM_VER_MINOR,SM_VER_PATCH,0
+ PRODUCTVERSION SM_VER_MAJOR,SM_VER_MINOR,SM_VER_PATCH,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "CompanyName",      "SerialMate"
+            VALUE "FileDescription",  "SerialMate - 串口/SSH 调试工具"
+            VALUE "FileVersion",      SM_VERSION
+            VALUE "InternalName",     "serial_gui"
+            VALUE "OriginalFilename", "serial_gui.exe"
+            VALUE "ProductName",      "SerialMate"
+            VALUE "ProductVersion",   SM_VERSION
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

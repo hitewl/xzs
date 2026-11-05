@@ -3,6 +3,7 @@
 // 编译：x86_64-w64-mingw32-g++-posix -std=c++17 -O2 -static -static-libgcc -static-libstdc++ \
 //        -municode -mwindows -o serial_gui.exe serial_gui.cpp -lws2_32 -lcomctl32 -lcomdlg32 -lgdi32
 #include "common.h"
+#include "version.h"
 #include "ssh.h"
 #include "term.h"
 #include <commctrl.h>
@@ -4135,7 +4136,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             refreshPorts();
             applyFont();
             updateStatus();
-            appendRun(L"SerialMate · 「会话 → 新建会话」(Ctrl+N) 选择 串口 / SSH / Telnet / 远程串口。\r\n", C_HINT);
+            appendRun(L"SerialMate " SM_VERSION_W L" · 「会话 → 新建会话」(Ctrl+N) 选择 串口 / SSH / Telnet / 远程串口。\r\n", C_HINT);
             appendRun(L"— 输出区可直接键盘输入（Enter 执行，↑↓ 调历史）—\r\n\r\n", C_HINT);
             // 开箱即用：按上次的配置建成第一条会话并连上
             {
@@ -4601,12 +4602,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 case IDM_HELP_ABOUT:
                     MessageBoxW(hwnd,
-                                L"SerialMate · AI串口 (C++ 单进程版)\n\n"
+                                L"SerialMate " SM_VERSION_W L"\n"
+                                L"编译于 " SM_BUILD_W L"\n\n"
                                 L"· 独占串口，内置接管服务 127.0.0.1:7000\n"
                                 L"· 在输出区直接输入；↑↓ 调历史，Ctrl+C 中断\n"
                                 L"· 视图菜单可调字号；配置存 serialmate.ini\n\n"
-                                L"协议：newline JSON + base64 (in / out / tx / meta)",
-                                L"关于", MB_OK | MB_ICONINFORMATION);
+                                L"协议：newline JSON + base64 (in / out / tx / meta)\n"
+                                L"命令行：serial_gui.exe --version 查看版本",
+                                L"关于 SerialMate " SM_VERSION_W, MB_OK | MB_ICONINFORMATION);
                     return 0;
             }
             break;
@@ -4650,7 +4653,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
+// --version / -v：打印版本后直接退出，不建窗口。
+// 这是个 -mwindows 进程，自己没有控制台，要 AttachConsole 挂到调用它的 cmd/bash 才能
+// 看到输出；挂不上（比如双击带参数的快捷方式）就退化成弹窗，别让人以为程序没反应。
+static bool printVersionIfAsked(LPWSTR cmdLine) {
+    if (!cmdLine) return false;
+    std::wstring a = cmdLine;
+    while (!a.empty() && iswspace(a.front())) a.erase(a.begin());
+    while (!a.empty() && iswspace(a.back()))   a.pop_back();
+    if (a != L"--version" && a != L"-v" && a != L"-V") return false;
+
+    std::string out = "SerialMate " SM_VERSION " (build " SM_BUILD_A ")\n";
+    bool shown = false;
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD  n = 0;
+        if (h && h != INVALID_HANDLE_VALUE) {
+            WriteFile(h, out.c_str(), (DWORD)out.size(), &n, nullptr);
+            shown = (n > 0);
+        }
+        FreeConsole();
+    }
+    if (!shown)
+        MessageBoxW(nullptr, (L"SerialMate " SM_VERSION_W L"\n编译于 " SM_BUILD_W),
+                    L"版本", MB_OK | MB_ICONINFORMATION);
+    return true;
+}
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int) {
+    if (printVersionIfAsked(cmdLine)) return 0;
     g_inst = inst;
     SetProcessDPIAware();
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);   // TSF 组合状态查询要用 COM
@@ -4683,7 +4714,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     dc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     RegisterClassExW(&dc);
 
-    HWND hwnd = CreateWindowExW(0, L"SerialMateWnd", L"SerialMate · AI串口",
+    HWND hwnd = CreateWindowExW(0, L"SerialMateWnd", L"SerialMate " SM_VERSION_W L" · AI串口",
                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 1020, 700,
                                 nullptr, nullptr, inst, nullptr);
     if (!hwnd) return 1;
