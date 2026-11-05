@@ -261,7 +261,7 @@ void loadSettings() {
     g_baud = kBaits[g_baudIdx];
     if ((int)g_connType < 0 || (int)g_connType > 3) g_connType = CONN_SERIAL;
     if (g_rxEnc < 0 || g_rxEnc > 2) g_rxEnc = 0;
-    if (g_keysW < 90 || g_keysW > 460) g_keysW = 150;
+    if (g_keysW < kKeyMinW || g_keysW > kKeyMaxW) g_keysW = 150;
 }
 
 void saveSettings() {

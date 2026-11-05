@@ -562,10 +562,10 @@ LRESULT CALLBACK KeyProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR
                 GetClientRect(g_hwnd, &wr);
                 int sideW = g_sideOn ? kSideW : 24;
                 int maxW  = wr.right - 16 - sideW - 6 - kMinViewW - 6;
-                if (maxW > 460) maxW = 460;
+                if (maxW > kKeyMaxW) maxW = kKeyMaxW;   // 绝对上限：原 460 + 一个左侧栏宽度
                 int newW = wr.right - 8 - pt.x;
-                if (newW < 90) newW = 90;
-                if (maxW >= 90 && newW > maxW) newW = maxW;
+                if (newW < kKeyMinW) newW = kKeyMinW;
+                if (maxW >= kKeyMinW && newW > maxW) newW = maxW;
                 if (newW != g_keysW) {
                     g_keysW = newW;
                     layoutKeysOnly();                  // 拖动中终端保持原尺寸，栏直接盖上去，不重排不闪
