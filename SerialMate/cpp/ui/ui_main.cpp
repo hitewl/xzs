@@ -265,15 +265,15 @@ void layout(HWND hwnd) {
     int W = rc.right, H = rc.bottom;
 
     int top     = 8;
-    int sideW   = g_sideOn ? 196 : 24;
+    int sideW   = g_sideOn ? kSideW : 24;
     int statusH = 22;
     int viewH   = H - top - statusH - 8;
     int keysW   = g_keysOn ? g_keysW : 24;            // 收起时只留一条按钮
-    int maxKeys = W - 16 - sideW - 6 - 200;           // 终端至少留 200px
+    int maxKeys = W - 16 - sideW - 6 - kMinViewW - 6; // 终端至少留 kMinViewW
     if (keysW > maxKeys) keysW = maxKeys;
     if (keysW < 24) keysW = 24;
     int viewW = W - 16 - sideW - 6 - keysW - 6;
-    if (viewW < 120) { keysW = 0; viewW = W - 16 - sideW - 6; }
+    if (viewW < kMinViewW) { keysW = 0; viewW = W - 16 - sideW - 6; }
 
     // 左侧栏占满整列，折叠把手贴在其右边缘、垂直居中
     MoveWindow(g_hSide, 8, top, sideW, viewH, TRUE);
@@ -365,10 +365,10 @@ void layoutKeysOnly() {
     GetClientRect(g_hwnd, &rc);
     int W = rc.right, H = rc.bottom;
     int top = 8, statusH = 22;
-    int sideW = g_sideOn ? 196 : 24;
+    int sideW = g_sideOn ? kSideW : 24;
     int viewH = H - top - statusH - 8;
     int keysW = g_keysW;
-    int maxKeys = W - 16 - sideW - 6 - 200;
+    int maxKeys = W - 16 - sideW - 6 - kMinViewW - 6;   // 终端至少留 kMinViewW
     if (keysW > maxKeys) keysW = maxKeys;
     if (keysW < 24) keysW = 24;
     int keysX = W - 8 - keysW;
@@ -425,32 +425,34 @@ HWND mkBtn(HWND p, int id, const wchar_t* t) {
 
 void createControls(HWND hwnd) {
     // 终端：优先 RichEdit50W（支持着色），退化到 RichEdit20W / EDIT
+    //
+    // 样式里不要 WS_HSCROLL：实测（_wrap_test）带横向滚动条时 RichEdit 一律按
+    // 「不换行」排版，长行只能左右拖。去掉它 + EM_SETTARGETDEVICE(0,0) 才会
+    // 按客户区宽度自动折行（拖窗口宽度时跟着重排）。
+    DWORD viewStyle = WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE |
+                      ES_AUTOVSCROLL | ES_NOHIDESEL;
     g_hView = nullptr;
     if (LoadLibraryW(L"Msftedit.dll")) {
-        g_hView = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT50W", L"",
-                                  WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
-                                  ES_AUTOVSCROLL | ES_NOHIDESEL, 0, 0, 100, 100, hwnd,
-                                  (HMENU)IDC_VIEW, g_inst, nullptr);
+        g_hView = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT50W", L"", viewStyle,
+                                 0, 0, 100, 100, hwnd, (HMENU)IDC_VIEW, g_inst, nullptr);
         g_termReady = (g_hView != nullptr);
     }
     if (!g_hView) {
-        g_hView = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT20W", L"",
-                                  WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
-                                  ES_AUTOVSCROLL | ES_NOHIDESEL, 0, 0, 100, 100, hwnd,
-                                  (HMENU)IDC_VIEW, g_inst, nullptr);
+        g_hView = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT20W", L"", viewStyle,
+                                 0, 0, 100, 100, hwnd, (HMENU)IDC_VIEW, g_inst, nullptr);
         g_termReady = (g_hView != nullptr);
     }
     if (!g_hView) {
-        g_hView = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                                  WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
-                                  ES_AUTOVSCROLL | ES_NOHIDESEL, 0, 0, 100, 100, hwnd,
-                                  (HMENU)IDC_VIEW, g_inst, nullptr);
+        g_hView = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", viewStyle,
+                                 0, 0, 100, 100, hwnd, (HMENU)IDC_VIEW, g_inst, nullptr);
     }
     if (g_hView) {
         SendMessageW(g_hView, EM_EXLIMITTEXT, 0, 20 * 1024 * 1024);
-        // 关掉软换行：终端里“一行”就应该是屏幕上的一行，否则 readline 用 \r 重绘时
-        // 会以为在刷新屏幕行，而我们按逻辑行处理，长命令就会花屏
-        SendMessageW(g_hView, EM_SETTARGETDEVICE, 0, 1);
+        // 软换行：按控件宽度折行。
+        // lParam=1 是「不换行」（旧值，长行只能横向拖）；lParam=0 才是按窗口宽度换行。
+        // 折行只影响屏幕排版，文档里仍是同一个逻辑行，所以 \r 覆盖重绘、退格、
+        // 时间戳锚点（都按字符下标算）不受影响。
+        SendMessageW(g_hView, EM_SETTARGETDEVICE, 0, 0);
         // 订阅文本变化：用来抓 TSF 输入法绕过窗口消息直接写进来的上屏内容
         SendMessageW(g_hView, EM_SETEVENTMASK, 0, ENM_CHANGE);
         SetWindowSubclass(g_hView, ViewProc, 1, 0);
@@ -666,7 +668,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_GETMINMAXINFO: {
             auto* mmi = (MINMAXINFO*)lp;
-            mmi->ptMinTrackSize.x = 900;
+            // 硬下限：客户区 = 左距 + 会话栏 + 间隔 + 终端(kMinViewW) + 间隔 + 右栏折叠条 + 右距
+            // 900 是观感下限（两栏都展开时不至于挤成一团），两者取大，保证终端永远
+            // 不会窄于右侧栏默认宽度。
+            int sideW = g_sideOn ? kSideW : 24;
+            int frame = (GetSystemMetrics(SM_CXFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER)) * 2;
+            int needW = 8 + sideW + 6 + kMinViewW + 6 + 24 + 8 + frame;
+            mmi->ptMinTrackSize.x = needW > 900 ? needW : 900;
             mmi->ptMinTrackSize.y = 560;
             return 0;
         }

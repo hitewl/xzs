@@ -355,6 +355,9 @@ static const int kKeyRowH = 26;   // 单个按钮高
 static const int kKeyGap  = 5;    // 按钮间距
 static const int kKeyPad  = 8;    // 栏内边距
 static const int kResizeW = 6;    // 左边缘拖拽热区宽度（拖动改变栏宽）
+static const int kSideW    = 196; // 左侧会话栏宽度（展开态）
+static const int kKeyDefW  = 150; // 右侧快捷命令栏默认宽度（= app_state 里 g_keysW 初值）
+static const int kMinViewW = 150; // 终端区最小宽度：不低于右侧栏默认宽度
 
 // ---------------- 内部接口（按模块分组，实现见对应 .cpp） ----------------
 std::wstring exeDir();

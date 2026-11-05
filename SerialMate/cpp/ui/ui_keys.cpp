@@ -554,8 +554,8 @@ LRESULT CALLBACK KeyProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR
                 ScreenToClient(g_hwnd, &pt);
                 RECT wr;
                 GetClientRect(g_hwnd, &wr);
-                int sideW = g_sideOn ? 196 : 24;
-                int maxW  = wr.right - 16 - sideW - 6 - 200;
+                int sideW = g_sideOn ? kSideW : 24;
+                int maxW  = wr.right - 16 - sideW - 6 - kMinViewW - 6;
                 if (maxW > 460) maxW = 460;
                 int newW = wr.right - 8 - pt.x;
                 if (newW < 90) newW = 90;
