@@ -14,15 +14,18 @@ void loadShortcuts() {
                              L"free -m", L"df -h", L"ps | head", L"uname -a"};
     std::vector<std::pair<int, std::wstring>> got;
     FILE* f = _wfopen((exeDir() + L"\\shortcuts.ini").c_str(), L"r, ccs=UTF-8");
+    bool fileExists = (f != nullptr);
     if (f) {
-        wchar_t line[1024];
-        while (fgetws(line, 1024, f)) {
+        wchar_t line[4096];
+        while (fgetws(line, 4096, f)) {
             std::wstring s = trimW(line);
             size_t eq = s.find(L'=');
             if (eq == std::wstring::npos || eq < 2) continue;
             if (s[0] != L'F' && s[0] != L'f') continue;
             int n = _wtoi(s.c_str() + 1);
-            if (n < 1 || n > 99) continue;
+            // 编号只用于排序，不要设 99 这种人为上限：用户导入的文档常常几百行，
+            // 截断后重启就悄悄丢了后半段（saveShortcuts 会按实际条数写 F1..FN）。
+            if (n < 1) continue;
             got.push_back({n, s.substr(eq + 1)});
         }
         fclose(f);
@@ -32,7 +35,10 @@ void loadShortcuts() {
                   return a.first < b.first;
               });
     g_keys.clear();
-    if (got.empty()) {
+    if (!fileExists) {
+        // 只有首次运行（配置文件还不存在）才给一套默认命令。
+        // 用户清空列表后落盘的是"存在但没有有效条目"的文件，这时必须保持空，
+        // 否则每次启动都会把默认命令重新塞回来，看起来像"删了又自己长出来"。
         for (int i = 0; i < 8; i++) g_keys.push_back(def[i]);
     } else {
         for (auto& kv : got) if (!kv.second.empty()) g_keys.push_back(kv.second);
@@ -267,9 +273,15 @@ void keyImport() {
     ofn.lpstrFilter = L"文本 (*.txt;*.ini)\0*.txt;*.ini\0所有文件 (*.*)\0*.*\0";
     ofn.lpstrFile   = path;
     ofn.nMaxFile    = MAX_PATH;
-    ofn.lpstrTitle  = L"导入快捷命令（每行一条，追加到现有列表）";
+    ofn.lpstrTitle  = L"导入快捷命令（每行一条，追加到当前列表；文本模式以编辑框内容为准）";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     if (!GetOpenFileNameW(&ofn)) return;
+
+    // 文本模式下编辑框才是唯一事实来源。用户刚把内容删空、或手工改过几行，
+    // 这些改动平时只在切换模式/收起/退出时才写回 g_keys；导入必须先把它们收进来，
+    // 否则 keyTextReload 会把内存里的旧列表连同导入内容一起倒回编辑框，
+    // 看起来就是"清空了又自己长回来"。
+    if (g_keyTextMode) keyTextCollect();
 
     std::wstring txt = readTextAuto(path);
     if (txt.empty()) { appendRun(L"— 文件为空或读取失败 —\r\n", C_ERR); return; }
@@ -283,10 +295,15 @@ void keyImport() {
         start = (nl == std::wstring::npos) ? txt.size() + 1 : nl + 1;
         line = trimW(line);
         if (line.empty() || line[0] == L'#') continue;
-        // 兼容 "F1=xxx" 这种从 shortcuts.ini 直接拷过来的行
+        // 兼容 "F1=xxx" 这种从 shortcuts.ini 直接拷过来的行。
+        // 编号位数不设上限（F100= / F1000= 也要认），但必须是纯数字，
+        // 免得把文档里 "File=xxx" 之类的正文误剥掉前缀。
         if (line.size() > 2 && (line[0] == L'F' || line[0] == L'f')) {
             size_t eq = line.find(L'=');
-            if (eq != std::wstring::npos && eq < 4) {
+            bool numbered = eq != std::wstring::npos && eq > 1;
+            for (size_t i = 1; numbered && i < eq; ++i)
+                if (line[i] < L'0' || line[i] > L'9') numbered = false;
+            if (numbered) {
                 line = trimW(line.substr(eq + 1));
                 if (line.empty()) continue;
             }
