@@ -335,6 +335,10 @@ void termColsUpdate() {
 // 逻辑行 -> 渲染串：每条视觉行「时间戳 + 正文」，正文列宽 = 总列数 - 时间戳宽。
 // 最后再留 1 列余量：中文字体链接的宽度不严格等于 2×ASCII，差一点点就会被
 // RichEdit 二次软折行，出现一条没有时间戳的尾巴。
+//
+// 折行按「词」而不是按字符：ls 出来的 i2c-dev / ttyS0 这类名字被从中间切开后
+// 很难读，看起来像两条不同的东西。所以以空白为断点整词换行，词尾的空格跟着
+// 词走（续行不会以空格开头）；只有单个词本身就宽过一整行时，才退化成按字符硬切。
 
 std::wstring termBuildVis(const std::wstring& r) {
     if (!g_showTs || g_curTs.empty()) return r;        // 不显示时间戳：交给 RichEdit 软折行
@@ -342,15 +346,38 @@ std::wstring termBuildVis(const std::wstring& r) {
     if (cols < 24) return g_curTs + r;                 // 还不知道列宽/窗口太窄：不折，但时间戳必须有
     int limit = cols - (int)g_curTs.size() - 1;
     if (limit < 12) limit = 12;
+
     std::wstring out;
     out.reserve(g_curTs.size() + r.size() + (r.size() / (size_t)limit + 1) * (g_curTs.size() + 1));
     out += g_curTs;
     int col = 0;
-    for (wchar_t c : r) {
-        int cw = termCellW(c);
-        if (col + cw > limit) { out += L'\r'; out += g_curTs; col = 0; }
-        out += c;
-        col += cw;
+
+    const size_t n = r.size();
+    size_t i = 0;
+    while (i < n) {
+        // 切一段：非空白词 + 尾部空白（连续空白自成一段）
+        size_t j = i;
+        bool isSpace = (r[j] == L' ' || r[j] == L'\t');
+        if (isSpace) {
+            while (j < n && (r[j] == L' ' || r[j] == L'\t')) ++j;
+        } else {
+            while (j < n && r[j] != L' ' && r[j] != L'\t') ++j;
+            while (j < n && (r[j] == L' ' || r[j] == L'\t')) ++j;
+        }
+        int wseg = 0;
+        for (size_t k = i; k < j; ++k) wseg += termCellW(r[k]);
+
+        if (isSpace && col == 0) { i = j; continue; }        // 续行不靠空白起头
+        if (col > 0 && col + wseg > limit) {                 // 整段放不下：换行再放
+            out += L'\r'; out += g_curTs; col = 0;
+        }
+        for (size_t k = i; k < j; ++k) {                     // 单段超宽时在这里硬切
+            int cw = termCellW(r[k]);
+            if (col + cw > limit) { out += L'\r'; out += g_curTs; col = 0; }
+            out += r[k];
+            col += cw;
+        }
+        i = j;
     }
     return out;
 }
