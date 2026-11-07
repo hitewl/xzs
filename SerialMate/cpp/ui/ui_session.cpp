@@ -87,14 +87,19 @@ void updateStatus() {
         return;
     }
     if (curOn()) {
+        // 「已连接」只在真的收到过字节之后才敢说。串口打开成功和板子在不在线是两件事：
+        // 断电、线没接、波特率不对，句柄照样打得开。
+        const wchar_t* lead = L"已连接";
+        if (g_devState == DEV_PROBING)     lead = L"串口已打开(探测设备中)";
+        else if (g_devState == DEV_SILENT) lead = L"串口已打开(设备无响应)";
         // 有 AI 连着时把话说白：串口是独占的，这时本地敲键盘会被接管命令打断
         if ((int)g_peerCount > 0)
-            swprintf_s(buf, L"已连接 %ls @%d | %ls | 会话 %d | AI 接管中(%d)，本地输入仍可用但会被注入打断 | RX %lld B  TX %lld B",
-                       g_cur->name.c_str(), g_cur->baud, encName(), (int)g_sess.size(),
+            swprintf_s(buf, L"%ls %ls @%d | %ls | 会话 %d | AI 接管中(%d)，本地输入仍可用但会被注入打断 | RX %lld B  TX %lld B",
+                       lead, g_cur->name.c_str(), g_cur->baud, encName(), (int)g_sess.size(),
                        (int)g_peerCount, rx, tx);
         else
-            swprintf_s(buf, L"已连接 %ls @%d | %ls | 会话 %d | 接管 :7000(0) | RX %lld B  TX %lld B",
-                       g_cur->name.c_str(), g_cur->baud, encName(), (int)g_sess.size(), rx, tx);
+            swprintf_s(buf, L"%ls %ls @%d | %ls | 会话 %d | 接管 :7000(0) | RX %lld B  TX %lld B",
+                       lead, g_cur->name.c_str(), g_cur->baud, encName(), (int)g_sess.size(), rx, tx);
     } else {
         swprintf_s(buf, L"未连接 %ls | 会话 %d | RX %lld B  TX %lld B | 会话菜单 → 新建会话 (Ctrl+N)",
                    g_cur ? g_cur->name.c_str() : L"", (int)g_sess.size(), rx, tx);

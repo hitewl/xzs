@@ -71,6 +71,9 @@ void closePort(Session* s) {
         return;
     }
     s->stopRead = true;
+    // 串口一关，之前探测出来的"在线/无响应"结论就作废，别让它粘到下一个会话上
+    if (g_hwnd) KillTimer(g_hwnd, IDT_PROBE);
+    g_devState = DEV_UNKNOWN;
     if (s->isRemote && s->sock != INVALID_SOCKET) {
         ::shutdown(s->sock, SD_BOTH);
         ::closesocket(s->sock);

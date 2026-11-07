@@ -75,6 +75,8 @@ HBRUSH   g_brushMenu = nullptr, g_brushDlg = nullptr;
 bool g_showAgent = true;
 bool g_sttyAdapt = true;   // 打开会话后发 stty 让板子知道终端很宽（长命令不错位）
 bool g_serve = true;
+DevState g_devState = DEV_UNKNOWN;   // 串口对端在线状态（打开后探测才知道）
+long long g_probeRx = 0;
 bool g_localEcho = true;   // 按键本地先显示，不等板子回显（关掉则完全靠回显）
 bool g_dtr = false, g_rts = false;
 int g_rxEnc = 0;

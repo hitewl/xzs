@@ -52,7 +52,47 @@ void openPort(Session* s) {
     s->reader = std::thread(readerProc, s);
     appendRun(L"— 已打开 " + port + L" @" + std::to_wstring(s->baud) + L"-8N1 —\r\n", C_SYS);
     if (g_sttyAdapt && s == g_cur) SetTimer(g_hwnd, IDT_STTY, 700, nullptr);
+    // 打开成功只代表拿到本机句柄：串口没有握手，板子断电、线没接也都"打开成功"。
+    // 主动发一个回车要提示符，kProbeMs 内一个字节都没回来就判定设备无响应，
+    // 免得用户对着「已连接」猜板子到底通没通电。
+    if (s == g_cur) {
+        devProbeStart(s);
+        {
+            std::lock_guard<std::mutex> lk(g_wrMtx);
+            unsigned char cr = '\r';
+            s->ser.write(&cr, 1);
+        }
+    }
     saveSettings();
+    updateStatus();
+}
+
+
+// ---------------- 设备在线探测 ----------------
+// 串口没有 TCP 那样的握手机制：CreateFile 成功只说明设备节点和句柄都拿到了，
+// 板子断电、TX/RX 没接、波特率完全不对，PC 侧一样"打开成功"。唯一可信的证据是
+// **有没有字节回来**。所以打开后发一个回车，超时没有回显就标明"设备无响应"。
+
+void devProbeStart(Session* s) {
+    if (!s) return;
+    g_devState = DEV_PROBING;
+    g_probeRx  = s->rx;
+    if (g_hwnd) SetTimer(g_hwnd, IDT_PROBE, kProbeMs, nullptr);
+}
+
+void devProbeTick() {
+    if (g_hwnd) KillTimer(g_hwnd, IDT_PROBE);
+    if (g_devState != DEV_PROBING) return;      // 期间已经收到数据（showRx 里翻成 ALIVE）
+    long long rx = g_cur ? g_cur->rx : 0;
+    if (rx > g_probeRx) {
+        g_devState = DEV_ALIVE;
+    } else {
+        g_devState = DEV_SILENT;
+        appendRun(L"— 串口已打开，但 " + std::to_wstring(kProbeMs) +
+                  L" ms 内没收到任何数据 —\r\n", C_ERR);
+        appendRun(L"— 板子刚上电请等启动完；仍无输出就查电源和串口线（TX/RX/GND 是否交叉接对） —\r\n",
+                  C_ERR);
+    }
     updateStatus();
 }
 

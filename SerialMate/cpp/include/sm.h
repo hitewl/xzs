@@ -81,6 +81,7 @@
 #define IDT_IME              2      // 输入法外来文本防抖同步
 #define IDT_STATUS           3      // 状态栏节流后的补刷
 #define IDT_CMD              4      // 一行多条命令（; 分隔）之间的发送间隔
+#define IDT_PROBE            5      // 打开串口后的「设备是否在线」探测
 
 #define IDM_VIEW_BIGGER      4001
 #define IDM_VIEW_SMALLER     4002
@@ -284,6 +285,12 @@ extern HBRUSH g_brushDlg;
 extern bool g_showAgent;
 extern bool g_sttyAdapt;   // 打开会话后发 stty 让板子知道终端很宽（长命令不错位）
 extern bool g_serve;
+
+// 打开 COM 口只说明「本机句柄拿到了」——串口没有握手，板子断电照样打开成功。
+// 所以打开后主动发一个回车要提示符，看有没有字节回来，才敢说设备在线。
+enum DevState { DEV_UNKNOWN = 0, DEV_PROBING, DEV_ALIVE, DEV_SILENT };
+extern DevState  g_devState;
+extern long long g_probeRx;      // 探测开始瞬间的 RX 计数快照
 extern bool g_localEcho;   // 按键本地先显示，不等板子回显（关掉则完全靠回显）
 extern bool g_dtr;
 extern bool g_rts;
@@ -354,6 +361,7 @@ static const int kSessPad  = 6;
 static const int kSessNewH = 26;
 static const int kKeyRowH = 26;   // 单个按钮高
 static const int kCmdGapMs = 450; // 一行里多条命令（; 分隔）之间的间隔：等上一条跑完再发下一条
+static const int kProbeMs  = 1500; // 打开串口后等这么久一个字节都没回来 → 判定设备无响应
 static const int kKeyGap  = 5;    // 按钮间距
 static const int kKeyPad  = 8;    // 栏内边距
 static const int kResizeW = 6;    // 左边缘拖拽热区宽度（拖动改变栏宽）
@@ -435,6 +443,8 @@ void readerProc(Session* s);
 void openPort(Session* s);
 bool openRemote(Session* s);
 void closePort(Session* s = nullptr);
+void devProbeStart(Session* s);   // 打开串口后：记 RX 快照 + 起 IDT_PROBE
+void devProbeTick();              // IDT_PROBE 回调：没数据就判「设备无响应」
 void startSsh(Session* s);
 void stopSsh(Session* s);
 void termSendBytes(const std::string& bytes, COLORREF color, const wchar_t* tag);

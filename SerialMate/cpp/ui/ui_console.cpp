@@ -450,6 +450,19 @@ void appendRun(const std::wstring& text, COLORREF color) {
 
 void showRx(const std::string& bytes) {
     if (g_cur) g_cur->rx += (long long)bytes.size();
+
+    // 探测期间/判定无响应之后，只要真收到字节就是「设备在线」——这是唯一可信的证据，
+    // 比打开串口成功有意义得多。从 SILENT 翻回来时补一行提示，让用户知道已经通了。
+    if (g_cur && !isTermSess(g_cur) && g_devState != DEV_ALIVE) {
+        bool wasSilent = (g_devState == DEV_SILENT);
+        g_devState = DEV_ALIVE;
+        if (wasSilent) {
+            if (g_hwnd) KillTimer(g_hwnd, IDT_PROBE);
+            appendRun(L"— 设备已响应，串口通信正常 —\r\n", C_SYS);
+            updateStatus();
+        }
+    }
+
     termFeed(bytes);                    // 时间戳由 termFeed 在每行行首插入
 
     // 存档用的纯文本
