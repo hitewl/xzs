@@ -80,6 +80,7 @@
 #define IDT_STTY             1      // 一次性定时器
 #define IDT_IME              2      // 输入法外来文本防抖同步
 #define IDT_STATUS           3      // 状态栏节流后的补刷
+#define IDT_CMD              4      // 一行多条命令（; 分隔）之间的发送间隔
 
 #define IDM_VIEW_BIGGER      4001
 #define IDM_VIEW_SMALLER     4002
@@ -352,6 +353,7 @@ static const int kSessGap  = 2;
 static const int kSessPad  = 6;
 static const int kSessNewH = 26;
 static const int kKeyRowH = 26;   // 单个按钮高
+static const int kCmdGapMs = 450; // 一行里多条命令（; 分隔）之间的间隔：等上一条跑完再发下一条
 static const int kKeyGap  = 5;    // 按钮间距
 static const int kKeyPad  = 8;    // 栏内边距
 static const int kResizeW = 6;    // 左边缘拖拽热区宽度（拖动改变栏宽）
@@ -495,6 +497,8 @@ void keyTextRunLine(int line);
 LRESULT CALLBACK KeyTextProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR);
 bool showInputBox(const wchar_t* title, const wchar_t* prompt, std::wstring& val);
 void runShortcut(int i);
+void keyRunCommand(const std::wstring& line);   // 一行按 ; 拆开，逐条发送
+void keyCmdTick();                             // IDT_CMD 回调：发下一条
 void keyAdd();
 void keyEdit(int i);
 void keyDel(int i);

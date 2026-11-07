@@ -1118,6 +1118,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 updateStatus();
                 return 0;
             }
+            if (wp == IDT_CMD) {                       // 一行多条命令：到点发下一条
+                keyCmdTick();
+                return 0;
+            }
             if (wp == IDT_STTY) {
                 KillTimer(hwnd, IDT_STTY);
                 // 让板子的 readline 知道终端很宽：超宽命令不会自己折行，

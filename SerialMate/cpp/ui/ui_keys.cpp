@@ -45,6 +45,99 @@ void loadShortcuts() {
     }
 }
 
+// 剥掉行内注释：`#` 或 `//` 之后的内容连同符号一起去掉。
+// 引号里的不算（echo "#1"），`://` 里的 // 也不算 —— 否则 wget http://… 会被截成 "wget http:"。
+std::wstring keyStripComment(const std::wstring& s) {
+    wchar_t quote = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        wchar_t c = s[i];
+        if (quote) {
+            if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == L'"' || c == L'\'') { quote = c; continue; }
+        if (c == L'#') return trimW(s.substr(0, i));
+        if (c == L'/' && i + 1 < s.size() && s[i + 1] == L'/') {
+            if (i > 0 && s[i - 1] == L':') continue;
+            return trimW(s.substr(0, i));
+        }
+    }
+    return trimW(s);
+}
+
+
+// 一行拆成多条命令：; 分隔，引号内的 ; 不拆（echo "a;b" 仍是一条）
+void keySplitCmds(const std::wstring& s, std::vector<std::wstring>& out) {
+    std::wstring cur;
+    wchar_t quote = 0;
+    for (wchar_t c : s) {
+        if (quote) {
+            cur += c;
+            if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == L'"' || c == L'\'') { quote = c; cur += c; continue; }
+        if (c == L';') {
+            std::wstring t = trimW(cur);
+            if (!t.empty()) out.push_back(t);
+            cur.clear();
+            continue;
+        }
+        cur += c;
+    }
+    std::wstring t = trimW(cur);
+    if (!t.empty()) out.push_back(t);
+}
+
+
+// 整段文本 → 逐行剥注释、丢空行
+void keyParseLines(const std::wstring& text, std::vector<std::wstring>& out) {
+    size_t p = 0;
+    while (p <= text.size()) {
+        size_t q = text.find(L'\n', p);
+        std::wstring line = (q == std::wstring::npos) ? text.substr(p) : text.substr(p, q - p);
+        p = (q == std::wstring::npos) ? text.size() + 1 : q + 1;
+        line = keyStripComment(line);
+        if (!line.empty()) out.push_back(line);
+    }
+}
+
+
+// 待发送命令队列：一行写了 `cmd1; cmd2; cmd3` 时逐条发，前一条发出去后
+// 用 IDT_CMD 隔开再发下一条，避免几条命令糊成一坨
+static std::vector<std::wstring> g_cmdQ;
+static size_t g_cmdQi = 0;
+
+void keyRunCommand(const std::wstring& line) {
+    std::wstring cmd = keyStripComment(line);
+    std::vector<std::wstring> parts;
+    keySplitCmds(cmd, parts);
+    if (parts.empty()) return;                 // 整行都是注释，不发
+    g_cmdQ.swap(parts);
+    g_cmdQi = 0;
+    keyCmdTick();                              // 先发第一条
+}
+
+void keyCmdTick() {
+    if (g_cmdQi >= g_cmdQ.size()) {             // 队列跑完
+        KillTimer(g_hwnd, IDT_CMD);
+        g_cmdQ.clear();
+        g_cmdQi = 0;
+        return;
+    }
+    termSendBytes(txEncode(g_cmdQ[g_cmdQi]) + "\r", C_TX, nullptr);
+    lineReset();
+    ++g_cmdQi;
+    if (g_cmdQi < g_cmdQ.size()) {
+        SetTimer(g_hwnd, IDT_CMD, kCmdGapMs, nullptr);   // 隔一会儿再发下一条
+    } else {
+        KillTimer(g_hwnd, IDT_CMD);
+        g_cmdQ.clear();
+        g_cmdQi = 0;
+    }
+}
+
+
 void keyBarRefresh() {
     if (g_hKeysBar) {
         int maxS = 0;
@@ -72,7 +165,7 @@ void updateKeysModeBtn() {
 }
 
 
-// 把编辑框内容按行拆成命令列表（空行忽略），写回 g_keys 并落盘
+// 把编辑框内容按行拆成命令列表（剥注释、空行忽略），写回 g_keys 并落盘
 
 void keyTextCollect() {
     if (!g_hKeyText) return;
@@ -83,15 +176,7 @@ void keyTextCollect() {
     all.resize(got > 0 ? (size_t)got : 0);
 
     std::vector<std::wstring> out;
-    size_t p = 0;
-    while (p <= all.size()) {
-        size_t q = all.find(L'\n', p);
-        std::wstring s = all.substr(p, q == std::wstring::npos ? std::wstring::npos : q - p);
-        s = trimW(s);
-        if (!s.empty()) out.push_back(s);
-        if (q == std::wstring::npos) break;
-        p = q + 1;
-    }
+    keyParseLines(all, out);          // # 与 // 之后算注释，整行注释/空行不进列表
     g_keys.swap(out);
     saveShortcuts();
     keyBarRefresh();
@@ -142,8 +227,7 @@ void keyTextRunLine(int line) {
     buf[n] = 0;
     std::wstring cmd = trimW(buf);
     if (cmd.empty()) return;
-    termSendBytes(txEncode(cmd) + "\r", C_TX, nullptr);
-    lineReset();
+    keyRunCommand(cmd);            // 剥注释；行内多条用 ; 分开逐条发
 }
 
 
@@ -166,8 +250,7 @@ LRESULT CALLBACK KeyTextProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD
 
 void runShortcut(int i) {
     if (i < 0 || i >= (int)g_keys.size()) return;
-    termSendBytes(txEncode(g_keys[i]) + "\r", C_TX, nullptr);
-    lineReset();
+    keyRunCommand(g_keys[i]);      // 剥注释；行内多条用 ; 分开逐条发
     // 焦点要还给它真正显示的那个控件：SSH 会话的显示区是 Terminal，
     // 原来无条件 SetFocus(g_hView)，会把手写焦点交给一个被隐藏的 RichEdit。
     if (g_cur && isTermSess(g_cur) && g_cur->term) g_cur->term->focus();
@@ -273,7 +356,7 @@ void keyImport() {
     ofn.lpstrFilter = L"文本 (*.txt;*.ini)\0*.txt;*.ini\0所有文件 (*.*)\0*.*\0";
     ofn.lpstrFile   = path;
     ofn.nMaxFile    = MAX_PATH;
-    ofn.lpstrTitle  = L"导入快捷命令（每行一条，追加到当前列表；文本模式以编辑框内容为准）";
+    ofn.lpstrTitle  = L"导入快捷命令（每行一条，追加到当前列表；# 或 // 之后为注释；空文件会清空列表）";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     if (!GetOpenFileNameW(&ofn)) return;
 
@@ -283,18 +366,22 @@ void keyImport() {
     // 看起来就是"清空了又自己长回来"。
     if (g_keyTextMode) keyTextCollect();
 
+    // 空文件是合法输入（用来一键清空列表），只有真读不到文件才算错误
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+        appendRun(L"— 无法读取该文件 —\r\n", C_ERR);
+        return;
+    }
     std::wstring txt = readTextAuto(path);
-    if (txt.empty()) { appendRun(L"— 文件为空或读取失败 —\r\n", C_ERR); return; }
 
-    int added = 0;
+    std::vector<std::wstring> lines;
     size_t start = 0;
     while (start <= txt.size()) {
         size_t nl = txt.find(L'\n', start);
         std::wstring line = (nl == std::wstring::npos) ? txt.substr(start)
                                                        : txt.substr(start, nl - start);
         start = (nl == std::wstring::npos) ? txt.size() + 1 : nl + 1;
-        line = trimW(line);
-        if (line.empty() || line[0] == L'#') continue;
+        line = keyStripComment(line);        // # 与 // 之后的内容都算注释
+        if (line.empty()) continue;
         // 兼容 "F1=xxx" 这种从 shortcuts.ini 直接拷过来的行。
         // 编号位数不设上限（F100= / F1000= 也要认），但必须是纯数字，
         // 免得把文档里 "File=xxx" 之类的正文误剥掉前缀。
@@ -308,13 +395,23 @@ void keyImport() {
                 if (line.empty()) continue;
             }
         }
-        g_keys.push_back(line);
-        added++;
+        lines.push_back(line);
     }
+
+    if (lines.empty()) {                     // 空文件 / 整份都是注释 → 清空列表
+        g_keys.clear();
+        saveShortcuts();
+        keyBarRefresh();
+        if (g_keyTextMode) keyTextReload(true);
+        appendRun(L"— 文件为空，已清空快捷命令列表 —\r\n", C_SYS);
+        return;
+    }
+
+    for (auto& s : lines) g_keys.push_back(s);
     saveShortcuts();
     keyBarRefresh();
     if (g_keyTextMode) keyTextReload(true);        // 文本模式：把导入结果同步到编辑框
-    appendRun(L"— 已导入 " + std::to_wstring(added) + L" 条快捷命令 —\r\n", C_SYS);
+    appendRun(L"— 已导入 " + std::to_wstring(lines.size()) + L" 条快捷命令 —\r\n", C_SYS);
 }
 
 void drawKeysBar(const DRAWITEMSTRUCT* ds) {
