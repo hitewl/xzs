@@ -310,6 +310,8 @@ extern std::wstring g_lshow;   // 当前行已渲染到控件里的渲染串（�
 // 当前行的时间戳。必须缓存：渲染串要参与 diff，若每次重建都取新时间，整行会不停重画。
 extern std::wstring g_curTs;
 extern int g_termCols;   // 终端按字体实测出来的可用列数（0=还没测）
+extern int g_termRows;   // 终端可见行数（客户区高度 ÷ 行高，0=还没测）
+extern int g_sttyCols;   // 上次同步给板子的列数（-1=从未同步，用于判断要不要重发）
 extern int g_esc;   // 0=普通 1=ESC 2=CSI 3=OSC 4=两字节转义
 extern std::wstring g_csi;   // CSI 参数缓存
 extern COLORREF g_tcolor;   // 当前输出颜色
@@ -407,6 +409,9 @@ void termInsertBytes(const std::string& s);
 int  termCellW(wchar_t c);
 std::wstring termBuildVis(const std::wstring& r);
 void termColsUpdate();
+// 把终端真实尺寸（去掉时间戳后的正文列数 / 可见行数）同步给板子：stty + COLUMNS/LINES。
+// 板子按这个宽度排版，ls / ps 的多列输出才会和屏幕上的格子对齐。
+void syncTermSize();
 bool echoSensitive();
 void termLocalEcho(const std::string& b);
 void termCommitLine();

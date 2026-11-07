@@ -177,7 +177,7 @@ void buildMenu() {
     mAddMenu(g_menuTool, MF_STRING, IDM_PORT_DTR, L"DTR 有效");
     mAddMenu(g_menuTool, MF_STRING, IDM_PORT_RTS, L"RTS 有效");
     mAddMenu(g_menuTool, MF_SEPARATOR, 0, nullptr);
-    mAddMenu(g_menuTool, MF_STRING, IDM_TOOL_STTY, L"打开会话时适配终端宽度 (stty cols 400)");
+    mAddMenu(g_menuTool, MF_STRING, IDM_TOOL_STTY, L"打开会话时适配终端尺寸 (stty cols/rows)");
     mAddMenu(g_menuTool, MF_SEPARATOR, 0, nullptr);
     mAddMenu(g_menuTool, MF_STRING, IDM_LOG_SAVE, L"保存串口日志");
     mAddMenu(g_menuTool, MF_STRING, IDM_LOG_DIR, L"设置日志目录…");
@@ -288,6 +288,12 @@ void layout(HWND hwnd) {
     MoveWindow(g_hView, 8 + sideW + 6, top, viewW, viewH, TRUE);
     // 折行要按「字体实测列数」算，窗口一变就得重新量（见 termBuildVis）
     termColsUpdate();
+
+    // 列数变了就延时把新宽度同步给板子（stty/COLUMNS）。防抖：拖动窗口时 layout 会被
+    // 连续调用，定时器反复重设，松手 800ms 后才真正下发，免得一拖动就往串口灌一堆命令。
+    if (g_sttyAdapt && curOn() && !isTermSess(g_cur) &&
+        g_termCols > 0 && g_termCols != g_sttyCols)
+        SetTimer(hwnd, IDT_STTY, 800, nullptr);
 
     // SSH 会话：终端控件顶替 RichEdit 占同一块区域
     bool sshMode = (g_cur && isTermSess(g_cur));
@@ -1005,8 +1011,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_sttyAdapt = !g_sttyAdapt;
                     saveSettings();
                     syncMenuChecks();
-                    if (g_sttyAdapt && curOn() && !isTermSess(g_cur))
-                        termSendBytes("\x15shopt -s checkwinsize 2>/dev/null; stty cols 400 rows 100 2>/dev/null; COLUMNS=400; LINES=100; export COLUMNS LINES\r", C_TX, nullptr);
+                    if (g_sttyAdapt && curOn() && !isTermSess(g_cur)) syncTermSize();
                     return 0;
                 case IDM_PORT_DTR:
                     g_dtr = !g_dtr;
@@ -1130,10 +1135,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (wp == IDT_STTY) {
                 KillTimer(hwnd, IDT_STTY);
-                // 让板子的 readline 知道终端很宽：超宽命令不会自己折行，
-                // 避免它按 80 列重绘而与我们不换行的显示错位
-                if (g_sttyAdapt && curOn() && !isTermSess(g_cur))
-                    termSendBytes("\x15shopt -s checkwinsize 2>/dev/null; stty cols 400 rows 100 2>/dev/null; COLUMNS=400; LINES=100; export COLUMNS LINES\r", C_TX, nullptr);
+                // 把终端真实宽高告诉板子的 readline/COLUMNS：这样 ls / ps 的多列输出
+                // 正好塞满一行，既不自己折行，也不需要我们再折，天然对齐。
+                // 不能用 g_lb.empty() 判断"用户没在打字"——g_lb 里装着板子刚吐出来的
+                // 提示符，永远非空。改用"距上次本地回显的时间"：刚敲过键就等下一轮，
+                // 免得 Ctrl-U 把用户打的半截命令清掉。
+                if (g_sttyAdapt && curOn() && !isTermSess(g_cur) &&
+                    g_termCols > 0 && g_termCols != g_sttyCols &&
+                    GetTickCount() - g_echoStamp > 900) {
+                    // 节流：拖动窗口时列数会连着变几次，别每次都往串口灌一条命令——
+                    // 115200 下几条命令叠在一起，Ctrl-U 互相打断就是一屏残渣。
+                    static DWORD s_lastSync = 0;
+                    DWORD now = GetTickCount();
+                    if (now - s_lastSync < 1500) {
+                        SetTimer(hwnd, IDT_STTY, 600, nullptr);   // 稍后再看，尺寸应该已经定了
+                    } else {
+                        s_lastSync = now;
+                        syncTermSize();
+                    }
+                }
                 return 0;
             }
             break;

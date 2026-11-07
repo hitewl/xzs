@@ -51,7 +51,10 @@ void openPort(Session* s) {
     s->stopRead = false;
     s->reader = std::thread(readerProc, s);
     appendRun(L"— 已打开 " + port + L" @" + std::to_wstring(s->baud) + L"-8N1 —\r\n", C_SYS);
-    if (g_sttyAdapt && s == g_cur) SetTimer(g_hwnd, IDT_STTY, 700, nullptr);
+    // 只要求"是本地串口"，别贪心写成 `s == g_cur`：新建会话时 openPort 先跑、
+    // 切 g_cur 在后，用 g_cur 判断会导致定时器永远不设，stty 一次都发不出去。
+    // 真正发给哪个会话由 tick 里的 syncTermSize 决定（走当前会话）。
+    if (g_sttyAdapt) SetTimer(g_hwnd, IDT_STTY, 700, nullptr);
     // 打开成功只代表拿到本机句柄：串口没有握手，板子断电、线没接也都"打开成功"。
     // 主动发一个回车要提示符，kProbeMs 内一个字节都没回来就判定设备无响应，
     // 免得用户对着「已连接」猜板子到底通没通电。

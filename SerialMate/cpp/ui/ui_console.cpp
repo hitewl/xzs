@@ -299,9 +299,10 @@ void termColsUpdate() {
     // 首屏就出现一整条没有时间戳的长行（启动时 layout 早于控件创建，真机上见过）。
     if (!g_hView || !g_termReady) return;
     static int s_lastPt = 0;
-    if (s_lastPt != g_fontPt) { s_cwReal = 0; s_lastPt = g_fontPt; }   // 换字号：实测值作废
+    static int s_chReal = 0;                                          // 行高（px），量一次就缓存
+    if (s_lastPt != g_fontPt) { s_cwReal = 0; s_chReal = 0; s_lastPt = g_fontPt; }   // 换字号：实测值作废
     int cw = s_cwReal;
-    if (cw <= 0) {
+    if (cw <= 0 || s_chReal <= 0) {
         HDC hdc = GetDC(g_hView);
         if (!hdc) return;
         int dpi = GetDeviceCaps(hdc, LOGPIXELSY);
@@ -312,6 +313,9 @@ void termColsUpdate() {
         SIZE sz{};
         GetTextExtentPoint32W(hdc, L"0123456789", 10, &sz);
         cw = sz.cx > 0 ? (sz.cx + 9) / 10 : 8;
+        TEXTMETRICW tm{};
+        GetTextMetricsW(hdc, &tm);
+        s_chReal = tm.tmHeight > 0 ? (int)tm.tmHeight : 0;
         SelectObject(hdc, oldF);
         DeleteObject(hf);
         ReleaseDC(g_hView, hdc);
@@ -326,9 +330,42 @@ void termColsUpdate() {
     DWORD mg = (DWORD)SendMessageW(g_hView, EM_GETMARGINS, 0, 0);
     w -= (int)LOWORD(mg) + (int)HIWORD(mg);
     g_termCols = cw > 0 ? w / cw : 0;
+    if (s_chReal > 0) {
+        int rows = (cr2.bottom - cr2.top) / s_chReal;
+        if (rows > 5) g_termRows = rows;
+    }
 #ifdef SM_WRAP_TRACE
-    dbgLog(L"cols: pt=%d w=%d cw=%d -> cols=%d", g_fontPt, w, cw, g_termCols);
+    dbgLog(L"cols: pt=%d w=%d cw=%d ch=%d -> cols=%d rows=%d",
+           g_fontPt, w, cw, s_chReal, g_termCols, g_termRows);
 #endif
+}
+
+
+// 把终端真实尺寸同步给板子。
+//
+// 早先这里报的是死值 `stty cols 400`，意图是"让板子别自己折行，交给本工具折"。
+// 但 ls / ps 是按 COLUMNS 排版的：报 400 列，它们就输出 400 宽的行，我们再折一次，
+// 列宽全乱、长短不齐，看着就是一坨。
+//
+// 正确做法是报「屏幕上一行真正能放几个字符的正文」——也就是总列数减掉行首时间戳
+// 占掉的 11 列（"[HH:MM:SS] "），再留 1 列余量。这样板子排出来的行正好塞满，
+// 既不提前折、也不需要我们再折，多列输出天然对齐。
+
+void syncTermSize() {
+    if (!g_termReady || !g_hView) return;
+    int cols = g_termCols > 0 ? g_termCols : 80;
+    int reserve = g_showTs ? 12 : 0;
+    int c = cols - reserve;
+    if (c < 20) c = 80;
+    int r = g_termRows > 5 ? g_termRows : 24;
+    // 命令必须短到一行放得下：stty 生效前屏幕还是旧宽度，长命令会被折成两三行，
+    // 折行点又会被下一条命令的 Ctrl-U 打断，屏幕上就是一串错位残渣。
+    // 不用 export COLUMNS/LINES：ls / ps / df 都是直接 ioctl(TIOCGWINSZ) 读，
+    // stty 改的就是那个 winsize 结构，环境变量只是给少数读 COLUMNS 的程序兜底。
+    char buf[80];
+    snprintf(buf, sizeof(buf), "\x15stty cols %d rows %d\r", c, r);
+    termSendBytes(buf, C_TX, nullptr);
+    g_sttyCols = g_termCols;
 }
 
 

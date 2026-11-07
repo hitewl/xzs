@@ -94,6 +94,8 @@ long         g_lcp     = 0;        // 当前行文本在控件中的起始字符
 std::wstring g_lshow;              // 当前行已渲染到控件里的渲染串（含时间戳/折行）
 std::wstring g_curTs;              // 当前行的时间戳（缓存，避免渲染串每次都变）
 int          g_termCols = 0;       // 终端可用列数（按字体实测，0=未测）
+int          g_termRows = 0;       // 终端可见行数（客户区高 ÷ 行高，0=未测）
+int          g_sttyCols = -1;      // 上次同步给板子的列数（-1=还没同步过）
 int          g_esc     = 0;        // 0=普通 1=ESC 2=CSI 3=OSC 4=两字节转义
 std::wstring g_csi;                // CSI 参数缓存
 COLORREF     g_tcolor  = C_RX;     // 当前输出颜色
