@@ -153,15 +153,75 @@ void termAnchorCheck() {
 // 等于每敲一个字符就把整行删掉重写，屏幕上提示符和前文会一下一下地闪；
 // 现在按前缀求差集：在行尾追加时公共前缀就是整行，选区退化成插入点，
 // 只有真正改动的那几个字被重画，提示符不会再动。
+//
+// **g_lshow 存的是渲染串，不是逻辑文本**：多一个时间戳、几个硬换行。
+// 因为时间戳要出现在**每一条视觉行**的行首，而 RichEdit 的软换行是渲染层的，
+// 文档里没有换行符，续行的行首根本不存在，没法挂时间戳——只能自己算列宽、
+// 自己插 "\r" + 时间戳。所以这里先把逻辑行交给 termBuildVis 变成渲染串，再做 diff。
+
+void termCalibrate();   // 定义在下面 termColsUpdate 旁边
+
+// 把渲染串里「每行行首的时间戳」染成系统色（正文色由 termApplyColor 决定）。
+// 只处理与本次新写入区间 [from, vis.size()) 有交集的时间戳——前面的早就染过了，
+// 重复设格式会让 RichEdit 反复重排，整行发闪。
+
+void termTintTs(size_t from, const std::wstring& vis) {
+    if (!g_showTs || g_curTs.empty()) return;
+    size_t tsLen = g_curTs.size();
+    size_t p = from < vis.size() ? from : vis.size();
+    while (p > 0 && vis[p - 1] != L'\r') --p;               // 回退到所在视觉行行首
+    bool tinted = false;
+    for (; p + tsLen <= vis.size(); ) {
+        if ((p == 0 || vis[p - 1] == L'\r') && vis.compare(p, tsLen, g_curTs) == 0) {
+            if (p + tsLen > from) {
+                CHARRANGE cs{g_lcp + (long)p, g_lcp + (long)p + (long)tsLen};
+                SendMessageW(g_hView, EM_EXSETSEL, 0, (LPARAM)&cs);
+                CHARFORMAT2W cf{};
+                cf.cbSize = sizeof(cf);
+                cf.dwMask = CFM_COLOR;
+                cf.crTextColor = C_SYS;
+                SendMessageW(g_hView, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+                tinted = true;
+            }
+            p += tsLen;
+        } else ++p;
+    }
+    if (tinted) {
+        // 选区刚停在时间戳上，插入点格式会被带成灰色，压回文末并重设正文色
+        CHARRANGE ce{g_lcp + (long)vis.size(), g_lcp + (long)vis.size()};
+        SendMessageW(g_hView, EM_EXSETSEL, 0, (LPARAM)&ce);
+        termApplyColor();
+    }
+}
 
 void termSyncLine() {
     if (!g_hView || !g_termReady) return;
     termAnchorCheck();
+    // 行首时间戳在第一次渲染这一行时生成并缓存
+    if (g_showTs) {
+        if (g_tsNeed) { g_curTs = timestamp(); g_tsNeed = false; }
+    } else {
+        g_curTs.clear();
+        g_tsNeed = false;
+    }
     std::wstring r = rxDecode(g_lb);
-    if (r == g_lshow) return;
-    size_t n = r.size() < g_lshow.size() ? r.size() : g_lshow.size();
+    if (g_termCols <= 0) termColsUpdate();             // 首次渲染前一定先把列宽量出来
+    std::wstring vis = termBuildVis(r);
+#ifdef SM_WRAP_TRACE
+    dbgLog(L"sync show=%d need=%d cur=%d cols=%d lb=%d r=%d vis=%d lshow=%d lcp=%ld",
+           (int)g_showTs, (int)g_tsNeed, (int)g_curTs.size(), g_termCols,
+           (int)g_lb.size(), (int)r.size(), (int)vis.size(), (int)g_lshow.size(), g_lcp);
+    {
+        POINTL pe{};
+        SendMessageW(g_hView, EM_POSFROMCHAR, (WPARAM)&pe, g_lcp + (long)vis.size() - 1);
+        RECT cr3{}; GetClientRect(g_hView, &cr3);
+        dbgLog(L"  line: lastx=%ld clientW=%ld", (long)pe.x, (long)(cr3.right - cr3.left));
+    }
+#endif
+    if (vis == g_lshow) return;
+    size_t n = vis.size() < g_lshow.size() ? vis.size() : g_lshow.size();
     size_t cp = 0;
-    while (cp < n && r[cp] == g_lshow[cp]) ++cp;
+    while (cp < n && vis[cp] == g_lshow[cp]) ++cp;
     long s = g_lcp + (long)cp;
     CHARRANGE cr{s, g_lcp + (long)g_lshow.size()};
 #ifdef TERM_TRACE
@@ -169,34 +229,130 @@ void termSyncLine() {
       SendMessageW(g_hView, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&q);
       FILE* f = fopen("term_trace.txt", "a");
       if (f) { fprintf(f, "cp=%zu old=%zu new=%zu erase=%zu yH=%d mask=%08lx\n", cp, g_lshow.size(),
-                       r.size(), g_lshow.size() - cp, (int)q.yHeight, (unsigned long)q.dwMask); fclose(f); } }
+                       vis.size(), g_lshow.size() - cp, (int)q.yHeight, (unsigned long)q.dwMask); fclose(f); } }
 #endif
     SendMessageW(g_hView, EM_EXSETSEL, 0, (LPARAM)&cr);
     // 插入点紧接在同一颜色的文本后面时，格式天然就是对的，不必再设一次
     if (g_tcolor != g_appliedColor || s != g_colorEnd) termApplyColor();
-    viewReplace(r.c_str() + cp);
-    g_lshow = r;
-    g_colorEnd = s + (long)(r.size() - cp);
+    viewReplace(vis.c_str() + cp);
+    g_lshow = vis;
+    g_colorEnd = s + (long)(vis.size() - cp);
+    termTintTs(cp, vis);          // 新写进去的时间戳染灰（正文保持 g_tcolor）
+    termCalibrate();              // 顺带校正字宽（只影响下一行排版，不动这一行）
     SendMessageW(g_hView, EM_SCROLLCARET, 0, 0);
 }
 
 
-// 光标处写入字节：右侧已有内容按“覆盖”处理，超出部分插入（和真终端一致）
-// 行首时间戳：插在视图当前行起点，不进入 g_lb（字节账本不受影响）
+// 一个字符占几列：CJK/全角算 2 列，其余 1 列（和终端习惯一致）
 
-void termInsertTs() {
+int termCellW(wchar_t c) {
+    if (c < 0x1100) return 1;
+    if (c <= 0x115F) return 2;                        // 谚文字母
+    if (c >= 0x2E80 && c <= 0xA4CF) return 2;         // CJK 部首 / 汉字 / 假名
+    if (c >= 0xAC00 && c <= 0xD7A3) return 2;         // 谚文音节
+    if (c >= 0xF900 && c <= 0xFAFF) return 2;         // 兼容汉字
+    if (c >= 0xFE30 && c <= 0xFE6F) return 2;         // 兼容形式
+    if (c >= 0xFF00 && c <= 0xFF60) return 2;         // 全角
+    if (c >= 0xFFE0 && c <= 0xFFE6) return 2;
+    return 1;
+}
+
+
+// 字宽（px）。GDI 测出来的和 RichEdit 实际排版能差 20% 以上——RichEdit 的坐标是
+// 它自己的排版单位，不是 GetTextExtentPoint32 那套 em 估算。所以先用 GDI 顶一下，
+// 等 termCalibrate 从控件里量到真值就固定用它（只跟字号/DPI 有关，与窗口宽度无关，
+// 窗口缩放时可以一直沿用，见 termColsUpdate 里的复用）。
+static int s_cwReal = 0;
+
+// 用控件自己的排版位置量真字宽：时间戳里第 1 和第 11 个字符必在同一视觉行，
+// 它们的 x 差 ÷ 10 就是 RichEdit 眼里的一个字符宽。EM_POSFROMCHAR 传的是指针，
+// 只有同进程调用才有效（外部脚本用 SendMessage 量出来永远是 0）。
+void termCalibrate() {
     if (!g_hView || !g_termReady) return;
-    std::wstring ts = timestamp();
-    CHARRANGE cr{g_lcp, g_lcp};
-    SendMessageW(g_hView, EM_EXSETSEL, 0, (LPARAM)&cr);
-    COLORREF old = g_tcolor;
-    g_tcolor = C_SYS;
-    termApplyColor();
-    g_tcolor = old;
-    viewReplace(ts.c_str());
-    g_lcp += (long)ts.size();
-    g_lshow.clear();
-    g_colorEnd = g_lcp;
+    if (g_lshow.size() < 12 || g_lcp < 0) return;
+    POINTL a{}, b{};
+    SendMessageW(g_hView, EM_POSFROMCHAR, (WPARAM)&a, g_lcp + 1);
+    SendMessageW(g_hView, EM_POSFROMCHAR, (WPARAM)&b, g_lcp + 11);
+    int d = (int)(b.x - a.x);
+    if (d <= 10) return;                       // 跨行了或没量到：这次不算
+    int cw = (d + 5) / 10;
+    if (cw <= 0) return;
+    RECT cr2{};
+    GetClientRect(g_hView, &cr2);
+    int w = cr2.right - cr2.left;
+    if (w < 80) return;
+    int cols = w / cw;
+    if (cols > 12 && cols != g_termCols) {
+        s_cwReal = cw;
+        g_termCols = cols;
+#ifdef SM_WRAP_TRACE
+        dbgLog(L"calibrate: cw=%d w=%d -> cols=%d", cw, w, cols);
+#endif
+    }
+}
+
+
+// 实测终端可用列数：按当前字号造一个 Consolas 量字宽，再用客户区算列数。
+
+void termColsUpdate() {
+    // 控件还没建好就别覆盖：清成 0 会让 termBuildVis 走「不折行也不加时间戳」的兜底，
+    // 首屏就出现一整条没有时间戳的长行（启动时 layout 早于控件创建，真机上见过）。
+    if (!g_hView || !g_termReady) return;
+    static int s_lastPt = 0;
+    if (s_lastPt != g_fontPt) { s_cwReal = 0; s_lastPt = g_fontPt; }   // 换字号：实测值作废
+    int cw = s_cwReal;
+    if (cw <= 0) {
+        HDC hdc = GetDC(g_hView);
+        if (!hdc) return;
+        int dpi = GetDeviceCaps(hdc, LOGPIXELSY);
+        HFONT hf = CreateFontW(-MulDiv(g_fontPt, dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                               DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                               CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+        HGDIOBJ oldF = SelectObject(hdc, hf);
+        SIZE sz{};
+        GetTextExtentPoint32W(hdc, L"0123456789", 10, &sz);
+        cw = sz.cx > 0 ? (sz.cx + 9) / 10 : 8;
+        SelectObject(hdc, oldF);
+        DeleteObject(hf);
+        ReleaseDC(g_hView, hdc);
+    }
+
+    // 用客户区，别用 EM_GETRECT：RichEdit 的「格式化矩形」可能是上一次排版留下的
+    // 旧宽度（实测 441px vs 真实客户区 354px，偏大 25%），按它算会多放十几列，
+    // 结果每行都超宽、RichEdit 再软折一次，就冒出一条没有时间戳的尾巴。
+    RECT cr2{};
+    GetClientRect(g_hView, &cr2);
+    int w = cr2.right - cr2.left;
+    DWORD mg = (DWORD)SendMessageW(g_hView, EM_GETMARGINS, 0, 0);
+    w -= (int)LOWORD(mg) + (int)HIWORD(mg);
+    g_termCols = cw > 0 ? w / cw : 0;
+#ifdef SM_WRAP_TRACE
+    dbgLog(L"cols: pt=%d w=%d cw=%d -> cols=%d", g_fontPt, w, cw, g_termCols);
+#endif
+}
+
+
+// 逻辑行 -> 渲染串：每条视觉行「时间戳 + 正文」，正文列宽 = 总列数 - 时间戳宽。
+// 最后再留 1 列余量：中文字体链接的宽度不严格等于 2×ASCII，差一点点就会被
+// RichEdit 二次软折行，出现一条没有时间戳的尾巴。
+
+std::wstring termBuildVis(const std::wstring& r) {
+    if (!g_showTs || g_curTs.empty()) return r;        // 不显示时间戳：交给 RichEdit 软折行
+    int cols = g_termCols;
+    if (cols < 24) return g_curTs + r;                 // 还不知道列宽/窗口太窄：不折，但时间戳必须有
+    int limit = cols - (int)g_curTs.size() - 1;
+    if (limit < 12) limit = 12;
+    std::wstring out;
+    out.reserve(g_curTs.size() + r.size() + (r.size() / (size_t)limit + 1) * (g_curTs.size() + 1));
+    out += g_curTs;
+    int col = 0;
+    for (wchar_t c : r) {
+        int cw = termCellW(c);
+        if (col + cw > limit) { out += L'\r'; out += g_curTs; col = 0; }
+        out += c;
+        col += cw;
+    }
+    return out;
 }
 
 void termInsertBytes(const std::string& s) {
@@ -249,7 +405,8 @@ void termCommitLine() {
     g_bsPend = 0;
     g_bsSkip = 0;
     g_echoQ.clear();
-    g_tsNeed = true;                    // 新行开始，下一次输出补时间戳
+    g_tsNeed = true;                    // 新行开始，下一次渲染补时间戳
+    g_curTs.clear();                    // 时间戳必须换新的，否则下行还用上一行的
     g_lshow.clear();
     termColorReset();                   // 新行的插入点格式要重新设一次
     SendMessageW(g_hView, EM_SCROLLCARET, 0, 0);
@@ -285,6 +442,7 @@ void termClearAll() {
     g_lshow.clear();
     g_lcp = 0;
     g_tsNeed = true;
+    g_curTs.clear();
     termColorReset();
     { std::lock_guard<std::mutex> lk(g_textMtx); g_allText.clear(); }
 }
@@ -359,7 +517,7 @@ void termFeed(const std::string& bytes) {
     std::string run;
     auto flush = [&]() {
         if (run.empty()) return;
-        if (g_showTs && g_tsNeed) { g_tsNeed = false; termInsertTs(); }   // 每行行首补一次
+        // 时间戳不再单独插：termSyncLine 渲染整行时按视觉行补（见 termBuildVis）
         termInsertBytes(run);
         run.clear();
     };

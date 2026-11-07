@@ -17,6 +17,7 @@ void applySessionView(Session* t) {
     g_lc = 0;
     g_lshow.clear();
     g_lcp = caretToEnd();
+    g_curTs.clear();        // 渲染串里的时间戳不能跨会话复用
     g_tsNeed = (t->lineShow.empty() && t->lineBuf.empty());   // 上一行已收尾才补时间戳
     lineReset();
     // 整屏换掉不是用户输入：刷新「外来文本」基准，并在一小段时间内直接忽略外来文本判定，

@@ -286,6 +286,8 @@ void layout(HWND hwnd) {
         SetWindowPos(g_hSideBtn, HWND_TOP, bx, by, bw2, bh2, SWP_NOACTIVATE);
     }
     MoveWindow(g_hView, 8 + sideW + 6, top, viewW, viewH, TRUE);
+    // 折行要按「字体实测列数」算，窗口一变就得重新量（见 termBuildVis）
+    termColsUpdate();
 
     // SSH 会话：终端控件顶替 RichEdit 占同一块区域
     bool sshMode = (g_cur && isTermSess(g_cur));

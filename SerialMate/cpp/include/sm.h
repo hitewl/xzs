@@ -306,7 +306,10 @@ extern std::wstring g_logDirOpen;   // 当前已打开的日志目录
 extern std::string g_lb;   // 当前行原始字节
 extern size_t g_lc;   // 光标在本行中的字节偏移
 extern long g_lcp;   // 当前行文本在控件中的起始字符位置
-extern std::wstring g_lshow;   // 当前行已渲染出来的宽字符（用于整行替换）
+extern std::wstring g_lshow;   // 当前行已渲染到控件里的渲染串（含时间戳/折行，参与 diff）
+// 当前行的时间戳。必须缓存：渲染串要参与 diff，若每次重建都取新时间，整行会不停重画。
+extern std::wstring g_curTs;
+extern int g_termCols;   // 终端按字体实测出来的可用列数（0=还没测）
 extern int g_esc;   // 0=普通 1=ESC 2=CSI 3=OSC 4=两字节转义
 extern std::wstring g_csi;   // CSI 参数缓存
 extern COLORREF g_tcolor;   // 当前输出颜色
@@ -398,8 +401,12 @@ long docChars();
 void termEnsureCaret();
 void termAnchorCheck();
 void termSyncLine();
-void termInsertTs();
 void termInsertBytes(const std::string& s);
+// 渲染串：把逻辑行按「列宽 - 时间戳宽」自己折行，每段前面补时间戳。
+// RichEdit 的软换行只发生在渲染层，续行没有行首，没法挂时间戳——只能自己插硬换行。
+int  termCellW(wchar_t c);
+std::wstring termBuildVis(const std::wstring& r);
+void termColsUpdate();
 bool echoSensitive();
 void termLocalEcho(const std::string& b);
 void termCommitLine();
