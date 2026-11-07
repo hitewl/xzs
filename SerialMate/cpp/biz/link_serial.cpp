@@ -87,11 +87,7 @@ void devProbeTick() {
     if (rx > g_probeRx) {
         g_devState = DEV_ALIVE;
     } else {
-        g_devState = DEV_SILENT;
-        appendRun(L"— 串口已打开，但 " + std::to_wstring(kProbeMs) +
-                  L" ms 内没收到任何数据 —\r\n", C_ERR);
-        appendRun(L"— 板子刚上电请等启动完；仍无输出就查电源和串口线（TX/RX/GND 是否交叉接对） —\r\n",
-                  C_ERR);
+        g_devState = DEV_SILENT;    // 只在状态栏标注「设备无响应」，终端不打印提示
     }
     updateStatus();
 }
