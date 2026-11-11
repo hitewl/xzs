@@ -13,7 +13,7 @@
 
 #define SM_VER_MAJOR 1
 #define SM_VER_MINOR 3
-#define SM_VER_PATCH 5
+#define SM_VER_PATCH 6
 
 // 宏 -> 字符串必须两层展开，否则拿到的是宏名本身
 #define SM_STR2(x) #x

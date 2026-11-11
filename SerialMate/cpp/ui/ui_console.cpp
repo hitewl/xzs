@@ -961,20 +961,7 @@ LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PT
                     break;
                 case 'V':
                     if (GetKeyState(VK_CONTROL) & 0x8000) {
-                        if (OpenClipboard(h)) {
-                            HANDLE hd = GetClipboardData(CF_UNICODETEXT);
-                            if (hd) {
-                                auto* txt = (wchar_t*)GlobalLock(hd);
-                                if (txt) {
-                                    std::wstring s(txt);
-                                    GlobalUnlock(hd);
-                                    for (auto& ch : s) if (ch == L'\r' || ch == L'\n') ch = L' ';
-                                    termSendBytes(txEncode(s), C_TX, nullptr);
-                                    lineRecord(s);
-                                }
-                            }
-                            CloseClipboard();
-                        }
+                        viewPasteToPort();          // 和右键粘贴共用同一条路径
                         g_swallow = (wchar_t)22;
                         return 0;
                     }
@@ -998,7 +985,19 @@ LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PT
             break;
 
         case WM_CONTEXTMENU:
-            showViewMenu(h);          // 右键：复制/粘贴/全选/清屏 + 编码、时间戳、日志等功能设置
+            // 右键直接粘贴到串口（和 PuTTY / MobaXterm 的习惯一致），不再弹菜单。
+            // 功能菜单没丢：Shift+右键、或者键盘的菜单键（lParam == -1）仍然弹它，
+            // 否则编码、时间戳、日志这些设置就没有别的入口了。
+            if (l != (LPARAM)-1 && !(GetKeyState(VK_SHIFT) & 0x8000)) {
+                // 右键点过之后插入点可能落在点击处、选区也可能还亮着。
+                // 终端不是编辑器，粘贴走的是「发串口」，先清干净再发，免得回显错位。
+                CHARRANGE none{-1, -1};
+                SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&none);
+                termEnsureCaret();
+                viewPasteToPort();
+                return 0;
+            }
+            showViewMenu(h);
             return 0;
 
         case WM_SETFOCUS: {
@@ -1011,8 +1010,12 @@ LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PT
         case WM_LBUTTONUP: {
             LRESULT r = DefSubclassProc(h, m, w, l);
             // 单击（没有拖出选区）只会在 RichEdit 里挪走插入点，终端里没意义，退回行尾；
-            // 拖选/双击选词保持不动，那是为了复制
+            // termEnsureCaret 碰到有选区会直接返回，所以紧接着还能拿到拖选的结果
             termEnsureCaret();
+            // 选中即复制：拖选（含双击选词）一松手就把选区写进剪贴板。
+            // 没选区时 viewCopySel 自己会 return，单击不会把剪贴板刷掉。
+            // 复制走的是另一份剪贴板数据，不影响控件里的选区高亮。
+            viewCopySel();
             return r;
         }
 
